@@ -97,6 +97,7 @@ class DbusAggBatService(object):
         logging.info("Initializing VeDbusService...")
         self._dbusservice = VeDbusService(servicename, self._dbusConn, register=False)
         logging.info("VeDbusService initialized")
+
         self._timeOld = tt.time()
         # written when dynamic CVL limit activated
         self._DCfeedActive = False
@@ -752,9 +753,6 @@ class DbusAggBatService(object):
         LowTemperature_alarm_list = []
         BmsCable_alarm_list = []
 
-        # Per-battery SoC values (for DC load compensation safety check)
-        Soc_list = []
-
         # Charge/discharge parameters
 
         # the minimum of MaxChargeCurrent * NR_OF_BATTERIES to be transmitted
@@ -790,9 +788,7 @@ class DbusAggBatService(object):
                 step = "Read and calculate capacity, SoC, Time to go"
                 InstalledCapacity += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/InstalledCapacity")
 
-                # Always collect per-battery SoC for DC load compensation safety check
                 bat_soc = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Soc")
-                Soc_list.append(bat_soc)
 
                 if not settings.OWN_SOC:
                     ConsumedAmphours += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/ConsumedAmphours")
@@ -1266,21 +1262,163 @@ class DbusAggBatService(object):
         ######################################
         # DC load compensation (if enabled) #
         ######################################
+        #
+        # Instead of inflating CCL ourselves (which DVCC misallocates entirely to
+        # solar chargers, leaving the Multi with 0A), we publish a virtual
+        # com.victronenergy.dcsystem service.  This makes dbus-systemcalc-py set
+        # Dc/System/MeasurementType = 1, which activates DVCC's native dcsyscurrent
+        # compensation.  DVCC adds the DC load current to CCL *before* distributing
+        # among chargers, so both solar AND the Multi get a proper share.
+        #
+        # Auto-discovery: we enumerate every DC source/sink type that
+        # dbus-systemcalc-py considers in its estimation formula:
+        #   dc_system = solar + vebus + multi + alternator + charger
+        #               + fuelcell + dcsource + inverter - battery
+        #
+        # Battery current prefers SmartShunts (sub-amp precision) when the
+        # number of battery-category SmartShunts equals NR_OF_BATTERIES;
+        # otherwise falls back to the BMS aggregate power.
+        #
+        # Safety: we only publish positive DC load (consumption).  If the reading
+        # is unavailable or negative, we publish 0 (fail-safe: DVCC adds nothing).
 
         dc_load_current = 0.0
         dc_system_power = 0.0
-        if settings.DC_LOAD_COMPENSATION and Voltage > 0:
+        # These are set inside the try block and used by the logging section later.
+        solar_power = 0.0
+        vebus_power = 0.0
+        alternator_power = 0.0
+        charger_power = 0.0
+        fuelcell_power = 0.0
+        dcsource_power = 0.0
+        multi_power = 0.0
+        inverter_power = 0.0
+        battery_power = 0.0
+        shunt_count = 0
+
+        if settings.DC_LOAD_COMPENSATION and self._dcsystem_service is not None and Voltage > 0:
+            # We cannot read /Dc/System/Power from com.victronenergy.system because
+            # once our virtual dcsystem service exists, systemcalc reads from us
+            # instead of computing it -- creating a circular dependency.
             try:
-                dc_system_power = self._dbusMon.dbusmon.get_value(
-                    "com.victronenergy.system", "/Dc/System/Power"
-                )
-                if dc_system_power is not None and dc_system_power > 0:
+                # Helper: sum V*I for all services of a given type
+                def _sum_vi(svc_type):
+                    total = 0.0
+                    for svc in self._dbusMon.dbusmon.get_service_list(svc_type):
+                        v = self._dbusMon.dbusmon.get_value(svc, "/Dc/0/Voltage") or 0
+                        i = self._dbusMon.dbusmon.get_value(svc, "/Dc/0/Current") or 0
+                        total += v * i
+                    return total
+
+                # --- DC SOURCES (positive = providing power to the bus) ---
+
+                # 1. Solar MPPTs
+                solar_power = _sum_vi("com.victronenergy.solarcharger")
+
+                # 2. VE.Bus (Multi/Quattro)
+                if self._multi is not None:
+                    vv = self._dbusMon.dbusmon.get_value(self._multi, "/Dc/0/Voltage") or 0
+                    vi = self._dbusMon.dbusmon.get_value(self._multi, "/Dc/0/Current") or 0
+                    vebus_power = vv * vi
+                else:
+                    vebus_power = _sum_vi("com.victronenergy.vebus")
+
+                # 3. Multi RS and future inverter/chargers
+                multi_power = _sum_vi("com.victronenergy.multi")
+
+                # 4. Alternator / Orion XS (prefer /Dc/0/Power if available)
+                for alt_svc in self._dbusMon.dbusmon.get_service_list("com.victronenergy.alternator"):
+                    p = self._dbusMon.dbusmon.get_value(alt_svc, "/Dc/0/Power")
+                    if p is not None:
+                        alternator_power += p
+                    else:
+                        av = self._dbusMon.dbusmon.get_value(alt_svc, "/Dc/0/Voltage") or 0
+                        ai = self._dbusMon.dbusmon.get_value(alt_svc, "/Dc/0/Current") or 0
+                        alternator_power += av * ai
+
+                # 5. AC Chargers (Phoenix Smart Charger, etc.)
+                charger_power = _sum_vi("com.victronenergy.charger")
+
+                # 6. Fuel Cells
+                fuelcell_power = _sum_vi("com.victronenergy.fuelcell")
+
+                # 7. DC Sources (SmartShunts configured as DC source meters)
+                dcsource_power = _sum_vi("com.victronenergy.dcsource")
+
+                # 8. VE.Direct Inverters (consume from DC bus; current is negative
+                #    when inverting, so V*I gives negative power = load on DC bus).
+                #    Fallback to -Vac*Iac if DC values unavailable.
+                for inv_svc in self._dbusMon.dbusmon.get_service_list("com.victronenergy.inverter"):
+                    inv_i = self._dbusMon.dbusmon.get_value(inv_svc, "/Dc/0/Current")
+                    if inv_i is not None:
+                        inv_v = self._dbusMon.dbusmon.get_value(inv_svc, "/Dc/0/Voltage") or 0
+                        inverter_power += inv_v * inv_i
+                    else:
+                        # Fallback: estimate from AC output (negative = consuming DC)
+                        ac_v = self._dbusMon.dbusmon.get_value(inv_svc, "/Ac/Out/L1/V") or 0
+                        ac_i = self._dbusMon.dbusmon.get_value(inv_svc, "/Ac/Out/L1/I") or 0
+                        inverter_power -= ac_v * ac_i
+
+                # --- BATTERY POWER (drain side) ---
+                # Prefer SmartShunt readings when count matches NR_OF_BATTERIES.
+                # BMS current is often rounded (0A) while SmartShunts measure
+                # sub-amp currents accurately (e.g. 0.3A per battery).
+                # Exclude aggregate services to avoid double-counting.
+                _AGGREGATE_EXCLUSIONS = {
+                    "com.victronenergy.battery.aggregate",
+                    "com.victronenergy.battery.aggregateshunts",
+                }
+                battery_power_from_shunts = 0.0
+                shunt_count = 0
+                for bat_svc in self._dbusMon.dbusmon.get_service_list("com.victronenergy.battery"):
+                    if bat_svc in _AGGREGATE_EXCLUSIONS:
+                        continue
+                    pn = self._dbusMon.dbusmon.get_value(bat_svc, "/ProductName") or ""
+                    if settings.SMARTSHUNT_NAME_KEYWORD in pn:
+                        sv = self._dbusMon.dbusmon.get_value(bat_svc, "/Dc/0/Voltage") or 0
+                        si = self._dbusMon.dbusmon.get_value(bat_svc, "/Dc/0/Current") or 0
+                        battery_power_from_shunts += sv * si
+                        shunt_count += 1
+
+                # Use SmartShunts only when we find exactly as many as physical batteries
+                if shunt_count == settings.NR_OF_BATTERIES:
+                    battery_power = battery_power_from_shunts
+                else:
+                    battery_power = Power  # BMS aggregate (less precise)
+
+                # --- FINAL CALCULATION ---
+                total_sources = (solar_power + vebus_power + multi_power
+                                 + alternator_power + charger_power
+                                 + fuelcell_power + dcsource_power
+                                 + inverter_power)
+                dc_system_power = total_sources - battery_power
+
+                if dc_system_power > 0:
                     dc_load_current = dc_system_power / Voltage
                 else:
                     dc_system_power = 0.0
-            except Exception:
+                    dc_load_current = 0.0
+
+            except Exception as e:
+                logging.debug("DC load calculation error: %s" % e)
                 dc_load_current = 0.0
                 dc_system_power = 0.0
+
+            # --- ENERGY TRACKING ---
+            now = tt.time()
+            if self._dcsys_last_time is not None and dc_system_power > 0:
+                dt_hours = (now - self._dcsys_last_time) / 3600.0
+                self._dcsys_energy_in += dc_system_power * dt_hours / 1000.0  # W*h -> kWh
+            self._dcsys_last_time = now
+
+            # Update the virtual DC system service so dbus-systemcalc-py and DVCC
+            # see a "measured" DC system value
+            with self._dcsystem_service as dcsys:
+                dcsys["/Dc/0/Power"] = round(dc_system_power, 1)
+                dcsys["/Dc/0/Current"] = round(dc_load_current, 1)
+                dcsys["/Dc/0/Voltage"] = round(Voltage, 2)
+                dcsys["/History/EnergyIn"] = round(self._dcsys_energy_in, 3)
+                dcsys["/History/EnergyOut"] = 0
 
         #######################
         # Send values to DBus #
@@ -1344,19 +1482,9 @@ class DbusAggBatService(object):
             bus["/Alarms/BmsCable"] = BmsCable_alarm
 
             # send charge/discharge control
-            if settings.DC_LOAD_COMPENSATION and MaxChargeCurrent > 0 and dc_load_current > 0:
-                # Skip compensation if any battery is at 100% SoC -- no point inflating CCL
-                # when a battery is already full. Resume once all are below 100%.
-                any_battery_full = Soc_list and any(s is not None and s >= 100 for s in Soc_list)
-                if not any_battery_full:
-                    # Safety: cap compensation at what batteries are requesting but not receiving,
-                    # plus a tolerance of 10% of true CCL for measurement imprecision and response delay.
-                    # Current > 0 means charging; actual_charge is how many amps reach the batteries now.
-                    actual_charge = max(0.0, Current)
-                    charge_deficit = max(0.0, MaxChargeCurrent - actual_charge)
-                    max_compensation = charge_deficit + (MaxChargeCurrent * 0.1)
-                    dc_load_current = min(dc_load_current, max_compensation)
-                    MaxChargeCurrent += dc_load_current
+            # Note: when DC_LOAD_COMPENSATION is enabled, we do NOT inflate MaxChargeCurrent
+            # here.  Instead, the virtual dcsystem service activates DVCC's native compensation
+            # which adds DC load current *before* distributing among chargers (solar + Multi).
             bus["/Info/MaxChargeCurrent"] = MaxChargeCurrent
             bus["/Info/MaxDischargeCurrent"] = MaxDischargeCurrent
             bus["/Info/MaxChargeVoltage"] = MaxChargeVoltage
@@ -1399,10 +1527,33 @@ class DbusAggBatService(object):
                     MaxCellVoltage - MinCellVoltage,
                 )
             )
-            if settings.DC_LOAD_COMPENSATION and dc_load_current > 0:
+            if settings.DC_LOAD_COMPENSATION:
+                # Build a compact summary of non-zero source contributions
+                src_parts = []
+                if solar_power:
+                    src_parts.append("solar=%.0fW" % solar_power)
+                if vebus_power:
+                    src_parts.append("vebus=%.0fW" % vebus_power)
+                if multi_power:
+                    src_parts.append("multi=%.0fW" % multi_power)
+                if alternator_power:
+                    src_parts.append("alt=%.0fW" % alternator_power)
+                if charger_power:
+                    src_parts.append("chgr=%.0fW" % charger_power)
+                if fuelcell_power:
+                    src_parts.append("fuel=%.0fW" % fuelcell_power)
+                if dcsource_power:
+                    src_parts.append("dcsrc=%.0fW" % dcsource_power)
+                if inverter_power:
+                    src_parts.append("inv=%.0fW" % inverter_power)
+                batt_src = "shunt×%d" % shunt_count if shunt_count == settings.NR_OF_BATTERIES else "bms"
+                src_parts.append("batt=%.0fW[%s]" % (battery_power, batt_src))
                 logging.info(
-                    "|- DC load compensation: +%.1fA (system %.0fW), published CCL: %.1fA"
-                    % (dc_load_current, dc_system_power, MaxChargeCurrent)
+                    "|- DC load comp: %.1fA / %.0fW (%s), energy=%.3fkWh, CCL: %.1fA"
+                    % (dc_load_current, dc_system_power,
+                       " ".join(src_parts),
+                       self._dcsys_energy_in,
+                       MaxChargeCurrent)
                 )
 
         return True

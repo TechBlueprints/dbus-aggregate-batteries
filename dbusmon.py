@@ -124,13 +124,48 @@ class DbusMon:
             "com.victronenergy.vebus": {
                 "/Connected": dummy,
                 "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
                 "/ProductName": dummy,
             },
             "com.victronenergy.solarcharger": {
                 "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
                 "/ProductName": dummy,
             },
             "com.victronenergy.settings": {"/Settings/CGwacs/OvervoltageFeedIn": dummy},
+            "com.victronenergy.alternator": {
+                "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/Dc/0/Power": dummy,
+                "/ProductName": dummy,
+            },
+            "com.victronenergy.charger": {
+                "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/ProductName": dummy,
+            },
+            "com.victronenergy.fuelcell": {
+                "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/ProductName": dummy,
+            },
+            "com.victronenergy.dcsource": {
+                "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/ProductName": dummy,
+            },
+            "com.victronenergy.multi": {
+                "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/ProductName": dummy,
+            },
+            "com.victronenergy.inverter": {
+                "/Dc/0/Current": dummy,
+                "/Dc/0/Voltage": dummy,
+                "/Ac/Out/L1/V": dummy,
+                "/Ac/Out/L1/I": dummy,
+                "/ProductName": dummy,
+            },
             "com.victronenergy.system": {
                 "/SystemState/LowSoc": dummy,
                 "/SystemState/BatteryLife": dummy,
