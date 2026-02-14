@@ -134,6 +134,7 @@ class DbusMon:
             "com.victronenergy.system": {
                 "/SystemState/LowSoc": dummy,
                 "/SystemState/BatteryLife": dummy,
+                "/Dc/System/Power": dummy,
             },
         }
 

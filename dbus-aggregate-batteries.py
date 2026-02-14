@@ -752,6 +752,9 @@ class DbusAggBatService(object):
         LowTemperature_alarm_list = []
         BmsCable_alarm_list = []
 
+        # Per-battery SoC values (for DC load compensation safety check)
+        Soc_list = []
+
         # Charge/discharge parameters
 
         # the minimum of MaxChargeCurrent * NR_OF_BATTERIES to be transmitted
@@ -787,10 +790,14 @@ class DbusAggBatService(object):
                 step = "Read and calculate capacity, SoC, Time to go"
                 InstalledCapacity += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/InstalledCapacity")
 
+                # Always collect per-battery SoC for DC load compensation safety check
+                bat_soc = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Soc")
+                Soc_list.append(bat_soc)
+
                 if not settings.OWN_SOC:
                     ConsumedAmphours += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/ConsumedAmphours")
                     Capacity += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Capacity")
-                    Soc += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Soc") * self._dbusMon.dbusmon.get_value(
+                    Soc += bat_soc * self._dbusMon.dbusmon.get_value(
                         self._batteries_dict[i], "/InstalledCapacity"
                     )
                     ttg = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/TimeToGo")
@@ -1256,6 +1263,25 @@ class DbusAggBatService(object):
                 # weighted sum
                 TimeToGo = TimeToGo / InstalledCapacity
 
+        ######################################
+        # DC load compensation (if enabled) #
+        ######################################
+
+        dc_load_current = 0.0
+        dc_system_power = 0.0
+        if settings.DC_LOAD_COMPENSATION and Voltage > 0:
+            try:
+                dc_system_power = self._dbusMon.dbusmon.get_value(
+                    "com.victronenergy.system", "/Dc/System/Power"
+                )
+                if dc_system_power is not None and dc_system_power > 0:
+                    dc_load_current = dc_system_power / Voltage
+                else:
+                    dc_system_power = 0.0
+            except Exception:
+                dc_load_current = 0.0
+                dc_system_power = 0.0
+
         #######################
         # Send values to DBus #
         #######################
@@ -1318,6 +1344,19 @@ class DbusAggBatService(object):
             bus["/Alarms/BmsCable"] = BmsCable_alarm
 
             # send charge/discharge control
+            if settings.DC_LOAD_COMPENSATION and MaxChargeCurrent > 0 and dc_load_current > 0:
+                # Skip compensation if any battery is at 100% SoC -- no point inflating CCL
+                # when a battery is already full. Resume once all are below 100%.
+                any_battery_full = Soc_list and any(s is not None and s >= 100 for s in Soc_list)
+                if not any_battery_full:
+                    # Safety: cap compensation at what batteries are requesting but not receiving,
+                    # plus a tolerance of 10% of true CCL for measurement imprecision and response delay.
+                    # Current > 0 means charging; actual_charge is how many amps reach the batteries now.
+                    actual_charge = max(0.0, Current)
+                    charge_deficit = max(0.0, MaxChargeCurrent - actual_charge)
+                    max_compensation = charge_deficit + (MaxChargeCurrent * 0.1)
+                    dc_load_current = min(dc_load_current, max_compensation)
+                    MaxChargeCurrent += dc_load_current
             bus["/Info/MaxChargeCurrent"] = MaxChargeCurrent
             bus["/Info/MaxDischargeCurrent"] = MaxDischargeCurrent
             bus["/Info/MaxChargeVoltage"] = MaxChargeVoltage
@@ -1360,6 +1399,11 @@ class DbusAggBatService(object):
                     MaxCellVoltage - MinCellVoltage,
                 )
             )
+            if settings.DC_LOAD_COMPENSATION and dc_load_current > 0:
+                logging.info(
+                    "|- DC load compensation: +%.1fA (system %.0fW), published CCL: %.1fA"
+                    % (dc_load_current, dc_system_power, MaxChargeCurrent)
+                )
 
         return True
 
