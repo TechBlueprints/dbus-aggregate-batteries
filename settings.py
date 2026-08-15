@@ -132,21 +132,12 @@ def get_smartshunts_from_config(group: str, option: str):
             # The driver match loop only handles those two types; bool/float/None
             # would crash it with a confusing error later, so reject up front.
             # bool is a subclass of int in Python — exclude it explicitly.
-            bad = [
-                (idx, item)
-                for idx, item in enumerate(val)
-                if isinstance(item, bool) or not isinstance(item, (int, str))
-            ]
+            bad = [(idx, item) for idx, item in enumerate(val) if isinstance(item, bool) or not isinstance(item, (int, str))]
             if bad:
-                errors_in_config.append(
-                    f"Invalid {option} list elements: {bad!r}. "
-                    "Each entry must be an int (VRM instance) or str (custom name)."
-                )
+                errors_in_config.append(f"Invalid {option} list elements: {bad!r}. Each entry must be an int (VRM instance) or str (custom name).")
                 return False
             return val
-    errors_in_config.append(
-        f"Invalid {option} value: {raw!r}. Expected True/False or list like [277]."
-    )
+    errors_in_config.append(f"Invalid {option} value: {raw!r}. Expected True/False or list like [277].")
     return False
 
 
@@ -327,6 +318,33 @@ if not CELL_DISCHARGE_LIMITED_CURRENT or len(CELL_DISCHARGE_LIMITED_CURRENT) < 2
 KEEP_MAX_CVL: bool = get_bool_from_config("DEFAULT", "KEEP_MAX_CVL")
 SEND_CELL_VOLTAGES: int = get_int_from_config("DEFAULT", "SEND_CELL_VOLTAGES")
 LOG_PERIOD: int = get_int_from_config("DEFAULT", "LOG_PERIOD")
+
+
+# ----- Dbus publish gate -----
+# Minimum change of a measured value before it is published on Dbus again.
+# 0 publishes on every change (repeated identical values are still suppressed).
+PUBLISH_GATE_VOLTAGE: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_VOLTAGE")
+PUBLISH_GATE_CURRENT: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_CURRENT")
+PUBLISH_GATE_POWER: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_POWER")
+PUBLISH_GATE_TEMPERATURE: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_TEMPERATURE")
+PUBLISH_GATE_SOC: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_SOC")
+PUBLISH_GATE_TIME_TO_GO: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_TIME_TO_GO")
+PUBLISH_GATE_CONSUMED_AMPHOURS: float = get_float_from_config("DEFAULT", "PUBLISH_GATE_CONSUMED_AMPHOURS")
+PUBLISH_HEARTBEAT: int = get_int_from_config("DEFAULT", "PUBLISH_HEARTBEAT")
+
+for _option, _value in (
+    ("PUBLISH_GATE_VOLTAGE", PUBLISH_GATE_VOLTAGE),
+    ("PUBLISH_GATE_CURRENT", PUBLISH_GATE_CURRENT),
+    ("PUBLISH_GATE_POWER", PUBLISH_GATE_POWER),
+    ("PUBLISH_GATE_TEMPERATURE", PUBLISH_GATE_TEMPERATURE),
+    ("PUBLISH_GATE_SOC", PUBLISH_GATE_SOC),
+    ("PUBLISH_GATE_TIME_TO_GO", PUBLISH_GATE_TIME_TO_GO),
+    ("PUBLISH_GATE_CONSUMED_AMPHOURS", PUBLISH_GATE_CONSUMED_AMPHOURS),
+):
+    check_config_issue(_value < 0, f"{_option} must be 0 or greater.")
+del _option, _value
+
+check_config_issue(PUBLISH_HEARTBEAT <= 0, "PUBLISH_HEARTBEAT must be greater than 0.")
 
 
 # print errors and exit if there are any
