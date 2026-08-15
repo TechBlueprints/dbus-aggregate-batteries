@@ -121,6 +121,8 @@ This driver is `derived`, so it publishes `Kind` and `TracksServices` and nothin
 
 A consumer can then exclude this service structurally instead of by name, and knows exactly which services it would be double counting.
 
+The full contract — value formats, how a consumer resolves the graph, and what an absent path means — is in [docs/measurement-topology.md](docs/measurement-topology.md). The same document ships with the battery drivers that publish the `direct` half.
+
 ### Smart Shunts as battery current source
 
 By default the aggregate computes bank current as `Quattro/Multiplus + solar chargers + DC-load shunts`. This is correct for most setups, but it cannot see current sources the driver does not enumerate — most notably Orion DC-DC converters (registered as `com.victronenergy.dcdc`), which often carry alternator charge into the battery bank. In that case the driver under-reports charge current and the alternator contribution is invisible to ESS, DVCC and VRM.
