@@ -23,140 +23,28 @@ be left advertising an empty declaration:
 * ``_find_multis``     - a MultiPlus/Quattro is used but no MPPTs are configured.
 * ``_find_mppts``      - MPPTs are configured and the expected number was found.
 
-``dbus``, ``vedbus``, ``dbusmon`` and ``gi``/``GLib`` are not importable off the
-Venus device, and ``settings`` exits the interpreter when no ``config.ini`` is
-present, so all of them are stubbed in ``sys.modules`` before the driver is
-loaded. The driver file name contains dashes and therefore cannot be imported
-by name; it is loaded through ``importlib.util.spec_from_file_location``.
+``dbus``, ``vedbus`` and ``gi``/``GLib`` are not importable off the Venus device,
+and ``settings`` exits the interpreter when no ``config.ini`` is present, so
+``driver_harness`` stubs them once for every suite and loads the dash-named
+driver by path. The device search reads a lot of settings and these tests vary
+them, so each test asks the harness for a fresh in-memory settings namespace
+instead of mutating a module-global one.
 
 The service object is never built through ``__init__`` (that one opens a real
-bus). Tests use ``object.__new__`` and set only the attributes the methods
-under test actually read.
+bus). Tests use ``driver_harness.new_service()``, which is ``object.__new__``
+plus only the attributes the methods under test actually read.
 """
 
 import ast
-import importlib.util
 import logging
-import os
-import sys
-import types
 import unittest
 
-_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_TESTS_DIR)
-_DRIVER_PATH = os.path.join(_REPO_ROOT, "dbus-aggregate-batteries.py")
-_DRIVER_MODULE_NAME = "dbus_aggregate_batteries_driver"
+import driver_harness
+
+driver = driver_harness.driver
 
 KIND_PATH = "/Measurement/Kind"
 TRACKS_PATH = "/Measurement/TracksServices"
-
-
-# ---------------------------------------------------------------------------
-# Stubs for the modules that only exist on a Venus OS device
-# ---------------------------------------------------------------------------
-
-
-class FakeGLib:
-    """Stand-in for ``gi.repository.GLib`` recording scheduled callbacks."""
-
-    timeouts = []
-
-    @classmethod
-    def reset(cls):
-        cls.timeouts = []
-
-    @classmethod
-    def timeout_add_seconds(cls, interval, callback, *args):
-        cls.timeouts.append((interval, callback))
-        return len(cls.timeouts)
-
-    @classmethod
-    def idle_add(cls, callback, *args):
-        cls.timeouts.append(("idle", callback))
-        return len(cls.timeouts)
-
-
-class Unusable:
-    """Placeholder for symbols the driver imports but tests must never call."""
-
-    def __init__(self, *args, **kwargs):
-        raise AssertionError("real D-Bus objects must not be constructed in unit tests")
-
-
-_DEFAULT_SETTINGS = {
-    "BATTERY_SERVICE_NAME": "com.victronenergy.battery",
-    "DCLOAD_SERVICE_NAME": "com.victronenergy.dcload",
-    "BATTERY_PRODUCT_NAME_PATH": "/ProductName",
-    "BATTERY_PRODUCT_NAME": "SerialBattery",
-    "BATTERY_INSTANCE_NAME_PATH": "/CustomName",
-    "SMARTSHUNT_INSTANCE_NAME_PATH": "/CustomName",
-    "SMARTSHUNT_NAME_KEYWORD": "SmartShunt",
-    "USE_SMARTSHUNTS": False,
-    "SEND_CELL_VOLTAGES": 0,
-    "NR_OF_CELLS_PER_BATTERY": 16,
-    "CAN_batteries": False,
-    "NR_OF_BATTERIES": 2,
-    "CURRENT_FROM_VICTRON": False,
-    "MULTI_KEYWORD": "com.victronenergy.vebus",
-    "NR_OF_MPPTS": 0,
-    "MPPT_KEYWORD": "com.victronenergy.solarcharger",
-    "SEARCH_TRIALS": 10,
-    "UPDATE_INTERVAL_DATA": 1000,
-    "UPDATE_INTERVAL_FIND_DEVICES": 3,
-    "TIME_BEFORE_RESTART": 0,
-    "OWN_CHARGE_PARAMETERS": False,
-}
-
-
-def _install_stubs():
-    """Register the unavailable modules in ``sys.modules``; return the settings stub."""
-    gi_module = types.ModuleType("gi")
-    repository_module = types.ModuleType("gi.repository")
-    repository_module.GLib = FakeGLib
-    gi_module.repository = repository_module
-    sys.modules.setdefault("gi", gi_module)
-    sys.modules.setdefault("gi.repository", repository_module)
-
-    dbus_module = types.ModuleType("dbus")
-    dbus_module.SystemBus = Unusable
-    dbus_module.SessionBus = Unusable
-    sys.modules.setdefault("dbus", dbus_module)
-
-    vedbus_module = types.ModuleType("vedbus")
-    vedbus_module.VeDbusService = Unusable
-    vedbus_module.VeDbusItemImport = Unusable
-    sys.modules.setdefault("vedbus", vedbus_module)
-
-    dbusmon_module = types.ModuleType("dbusmon")
-    dbusmon_module.DbusMon = Unusable
-    sys.modules.setdefault("dbusmon", dbusmon_module)
-
-    sys.modules.setdefault("settings", types.ModuleType("settings"))
-    settings_module = sys.modules["settings"]
-    _reset_settings(settings_module)
-    return settings_module
-
-
-def _reset_settings(settings_module):
-    for name, value in _DEFAULT_SETTINGS.items():
-        setattr(settings_module, name, value)
-
-
-def _load_driver():
-    """Load the dash-named driver file as an importable module object."""
-    if _DRIVER_MODULE_NAME in sys.modules:
-        return sys.modules[_DRIVER_MODULE_NAME]
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
-    spec = importlib.util.spec_from_file_location(_DRIVER_MODULE_NAME, _DRIVER_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[_DRIVER_MODULE_NAME] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-SETTINGS = _install_stubs()
-driver = _load_driver()
 
 
 def setUpModule():
@@ -172,68 +60,24 @@ def tearDownModule():
 # ---------------------------------------------------------------------------
 
 
-class FakeDbusService:
-    """Records every ``add_path`` and every ``__setitem__`` performed on it."""
-
-    def __init__(self):
-        self.values = {}
-        self.add_path_calls = []
-        self.set_calls = []
-
-    def add_path(self, path, value, **kwargs):
-        self.add_path_calls.append((path, value, kwargs))
-        self.values[path] = value
-
-    def __setitem__(self, path, value):
-        self.set_calls.append((path, value))
-        self.values[path] = value
-
-    def __getitem__(self, path):
-        return self.values[path]
-
-    def writes_to(self, path):
-        """Every value written to ``path`` through ``__setitem__``, in order."""
-        return [value for written_path, value in self.set_calls if written_path == path]
-
-
-class FakeBus:
-    def __init__(self, names):
-        self._names = list(names)
-
-    def list_names(self):
-        return list(self._names)
-
-
-class FakeDbusMonitor:
-    def __init__(self, values):
-        self._values = dict(values)
-
-    def get_value(self, service, path):
-        return self._values.get((service, path))
-
-
-class FakeDbusMon:
-    def __init__(self, values):
-        self.dbusmon = FakeDbusMonitor(values)
-
-
 def make_service(batteries=None, bus_names=(), monitor_values=None):
     """Build a DbusAggBatService without running its D-Bus touching __init__."""
-    service = object.__new__(driver.DbusAggBatService)
-    service._dbusservice = FakeDbusService()
-    service._dbusConn = FakeBus(bus_names)
-    service._dbusMon = FakeDbusMon(monitor_values or {})
-    service._batteries_dict = dict(batteries or {})
-    service._smartShunt_list = []
-    service._mppts_list = []
-    service._num_battery_shunts = 0
-    service._multi = None
-    service._searchTrials = 1
-    service._timeOld = 0.0
-    service._ownCharge = 0.5
-    service._reactive_ready = False
-    service._updating = False
-    return service
+    return driver_harness.new_service(
+        _dbusservice=driver_harness.RecordingDbusService(),
+        _dbusConn=driver_harness.FakeBus(bus_names),
+        # a path nobody scripted answers None here, the way a real monitor does
+        _dbusMon=driver_harness.FakeDbusMon(monitor_values or {}, default=None),
+        _batteries_dict=dict(batteries or {}),
+        _smartShunt_list=[],
+        _mppts_list=[],
+        _num_battery_shunts=0,
+        _multi=None,
+        _searchTrials=1,
+        _timeOld=0.0,
+        _ownCharge=0.5,
+        _reactive_ready=False,
+        _updating=False,
+    )
 
 
 def battery_monitor_values(services_by_name, product_name="SerialBattery(Jkbms)", cells=16):
@@ -252,8 +96,8 @@ def battery_monitor_values(services_by_name, product_name="SerialBattery(Jkbms)"
 
 
 def _parse_driver():
-    with open(_DRIVER_PATH, "r", encoding="utf-8") as handle:
-        return ast.parse(handle.read(), filename=_DRIVER_PATH)
+    with open(driver_harness.DRIVER_PATH, "r", encoding="utf-8") as handle:
+        return ast.parse(handle.read(), filename=driver_harness.DRIVER_PATH)
 
 
 def _literal(node):
@@ -344,7 +188,7 @@ class MeasurementDeclarationTests(unittest.TestCase):
 
 
 class CompletionPathTestCase(unittest.TestCase):
-    """Shared fixture: fresh settings and a clean GLib timeout log per test."""
+    """Shared fixture: fresh settings and a fresh GLib recorder per test."""
 
     # deliberately unsorted insertion order, and battery names whose sort order
     # is the reverse of the service-name sort order
@@ -356,9 +200,8 @@ class CompletionPathTestCase(unittest.TestCase):
     EXPECTED = "com.victronenergy.battery.ttyUSB0,com.victronenergy.battery.ttyUSB1,com.victronenergy.battery.ttyUSB2"
 
     def setUp(self):
-        _reset_settings(SETTINGS)
-        FakeGLib.reset()
-        self.addCleanup(FakeGLib.reset)
+        self.settings = driver_harness.use_stub_settings(self)
+        self.glib = driver_harness.patch_glib(self)
 
     def published(self, service):
         """The value currently on TRACKS_PATH, failing loudly if it was never filled."""
@@ -372,8 +215,8 @@ class CompletionPathTestCase(unittest.TestCase):
     def run_batteries_only_path(self, batteries=None):
         """Finish in _find_batteries: current comes from the BMSes."""
         batteries = self.BATTERIES if batteries is None else batteries
-        SETTINGS.CURRENT_FROM_VICTRON = False
-        SETTINGS.NR_OF_BATTERIES = len(batteries)
+        self.settings.CURRENT_FROM_VICTRON = False
+        self.settings.NR_OF_BATTERIES = len(batteries)
         service = make_service(
             bus_names=sorted(batteries.values()),
             monitor_values=battery_monitor_values(batteries),
@@ -384,7 +227,7 @@ class CompletionPathTestCase(unittest.TestCase):
     def run_no_mppt_path(self, batteries=None):
         """Finish in _find_multis: a Multi is used and no MPPTs are configured."""
         batteries = self.BATTERIES if batteries is None else batteries
-        SETTINGS.NR_OF_MPPTS = 0
+        self.settings.NR_OF_MPPTS = 0
         multi = "com.victronenergy.vebus.ttyO1"
         service = make_service(
             batteries=batteries,
@@ -398,7 +241,7 @@ class CompletionPathTestCase(unittest.TestCase):
         """Finish in _find_mppts: the configured number of MPPTs was found."""
         batteries = self.BATTERIES if batteries is None else batteries
         mppts = ["com.victronenergy.solarcharger.ttyO2", "com.victronenergy.solarcharger.ttyO3"]
-        SETTINGS.NR_OF_MPPTS = len(mppts)
+        self.settings.NR_OF_MPPTS = len(mppts)
         service = make_service(
             batteries=batteries,
             bus_names=mppts,
@@ -497,8 +340,8 @@ class TracksServicesFollowsDiscoveryTests(CompletionPathTestCase):
         self.assertEqual(sorted(service._batteries_dict.values()), sorted(self.BATTERIES.values()))
 
     def test_services_of_non_battery_devices_are_not_tracked(self):
-        SETTINGS.CURRENT_FROM_VICTRON = False
-        SETTINGS.NR_OF_BATTERIES = len(self.BATTERIES)
+        self.settings.CURRENT_FROM_VICTRON = False
+        self.settings.NR_OF_BATTERIES = len(self.BATTERIES)
         monitor_values = battery_monitor_values(self.BATTERIES)
         decoy = "com.victronenergy.battery.ttyUSB7"
         monitor_values[(decoy, "/ProductName")] = "Some Other BMS"
@@ -515,8 +358,8 @@ class TracksServicesNotPublishedBeforeCompletionTests(CompletionPathTestCase):
     """An unfinished search must not publish a partial constituent list."""
 
     def test_incomplete_battery_search_publishes_nothing(self):
-        SETTINGS.CURRENT_FROM_VICTRON = False
-        SETTINGS.NR_OF_BATTERIES = len(self.BATTERIES) + 1
+        self.settings.CURRENT_FROM_VICTRON = False
+        self.settings.NR_OF_BATTERIES = len(self.BATTERIES) + 1
         service = make_service(
             bus_names=sorted(self.BATTERIES.values()),
             monitor_values=battery_monitor_values(self.BATTERIES),
@@ -526,7 +369,7 @@ class TracksServicesNotPublishedBeforeCompletionTests(CompletionPathTestCase):
         self.assertFalse(service._reactive_ready)
 
     def test_multi_search_defers_publishing_to_the_mppt_search(self):
-        SETTINGS.NR_OF_MPPTS = 2
+        self.settings.NR_OF_MPPTS = 2
         multi = "com.victronenergy.vebus.ttyO1"
         service = make_service(
             batteries=self.BATTERIES,
@@ -538,7 +381,7 @@ class TracksServicesNotPublishedBeforeCompletionTests(CompletionPathTestCase):
         self.assertFalse(service._reactive_ready)
 
     def test_incomplete_mppt_search_publishes_nothing(self):
-        SETTINGS.NR_OF_MPPTS = 2
+        self.settings.NR_OF_MPPTS = 2
         found = ["com.victronenergy.solarcharger.ttyO2"]
         service = make_service(
             batteries=self.BATTERIES,
@@ -550,8 +393,8 @@ class TracksServicesNotPublishedBeforeCompletionTests(CompletionPathTestCase):
         self.assertFalse(service._reactive_ready)
 
     def test_battery_search_delegates_to_multi_search_without_publishing(self):
-        SETTINGS.CURRENT_FROM_VICTRON = True
-        SETTINGS.NR_OF_BATTERIES = len(self.BATTERIES)
+        self.settings.CURRENT_FROM_VICTRON = True
+        self.settings.NR_OF_BATTERIES = len(self.BATTERIES)
         service = make_service(
             bus_names=sorted(self.BATTERIES.values()),
             monitor_values=battery_monitor_values(self.BATTERIES),
@@ -559,8 +402,7 @@ class TracksServicesNotPublishedBeforeCompletionTests(CompletionPathTestCase):
         self.assertIs(service._find_batteries(), False)
         self.assertEqual(service._dbusservice.writes_to(TRACKS_PATH), [])
         self.assertFalse(service._reactive_ready)
-        scheduled = [callback for _, callback in FakeGLib.timeouts]
-        self.assertIn(service._find_multis, scheduled)
+        self.assertIn(service._find_multis, self.glib.scheduled_callbacks)
 
 
 if __name__ == "__main__":
