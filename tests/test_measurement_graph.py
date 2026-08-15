@@ -175,6 +175,21 @@ class MeasurementDeclarationTests(unittest.TestCase):
         declared = sorted(call[0] for call in measurement_add_path_calls())
         self.assertEqual(declared, [KIND_PATH, TRACKS_PATH])
 
+    def test_the_direct_only_keys_are_not_published(self):
+        """A derived service must not claim to measure a physical device.
+
+        /Measurement/PhysicalDevice, /PeerServices and /LineAuthority are
+        published by services with Kind "direct" — they identify the physical
+        thing being measured, the other services watching it, and which of them
+        is authoritative for the line. None of that is meaningful for a service
+        that computes its values from other services, and a consumer resolving
+        the graph would be misled by it.
+        """
+        declared = {call[0] for call in measurement_add_path_calls()}
+        for path in ("/Measurement/PhysicalDevice", "/Measurement/PeerServices", "/Measurement/LineAuthority"):
+            with self.subTest(path=path):
+                self.assertNotIn(path, declared)
+
     def test_kind_is_never_reassigned_after_declaration(self):
         self.assertNotIn(KIND_PATH, measurement_subscript_writes(), "%s is a constant declaration" % KIND_PATH)
 
