@@ -165,12 +165,10 @@ class _GatedDbusService:
         return getattr(self._svc, name)
 
 
-
 # our own D-Bus service name, and the prefix of the physical battery services we
 # aggregate (the trailing dot matters: it must not match e.g. a "batterysomething")
 AGGREGATE_SERVICE_NAME = "com.victronenergy.battery.aggregate"
 BATTERY_SERVICE_PREFIX = "com.victronenergy.battery."
-
 
 
 # How often the tolerated "a constituent is not serving data" state is repeated
@@ -827,8 +825,6 @@ class DbusAggBatService(object):
                 self._reactive_ready = True
                 GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
-
-
                 self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
                 GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
 
@@ -904,8 +900,6 @@ class DbusAggBatService(object):
             self._reactive_ready = True
             GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
-
-
             self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
             GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
 
@@ -945,8 +939,6 @@ class DbusAggBatService(object):
             self._timeOld = tt.time()
             self._reactive_ready = True
             GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
-
-
 
             self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
             GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
