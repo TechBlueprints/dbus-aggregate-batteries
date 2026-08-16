@@ -371,6 +371,12 @@ class DbusAggBatService(object):
         self._dbusservice.add_path("/FirmwareVersion", VERSION)
         self._dbusservice.add_path("/HardwareVersion", VERSION)
         self._dbusservice.add_path("/Connected", 1)
+        # Measurement-graph declaration: this service re-publishes values
+        # rolled up from other battery services; summing consumers must not
+        # count it alongside its constituents. See docs/measurement-topology.md.
+        # TracksServices is filled once the battery search completes.
+        self._dbusservice.add_path("/Measurement/Kind", "derived")
+        self._dbusservice.add_path("/Measurement/TracksServices", "", writeable=True)
 
         # Create DC paths
         self._dbusservice.add_path(
@@ -821,6 +827,11 @@ class DbusAggBatService(object):
                 self._reactive_ready = True
                 GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
+
+
+                self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
+                GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+
             # all OK, stop calling this function
             return False
         # if the correct number has not been found yet, repeat until SEARCH_TRIALS is reached
@@ -893,6 +904,11 @@ class DbusAggBatService(object):
             self._reactive_ready = True
             GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
+
+
+            self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
+            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
+
         # all OK, stop calling this function
         return False
 
@@ -929,6 +945,11 @@ class DbusAggBatService(object):
             self._timeOld = tt.time()
             self._reactive_ready = True
             GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
+
+
+
+            self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
+            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
             # all OK, stop calling this function
             return False
         elif self._searchTrials < settings.SEARCH_TRIALS:
