@@ -1138,11 +1138,10 @@ class DbusAggBatService(object):
         LowTemperature_alarm = self._fn._max(LowTemperature_alarm_list)
         BmsCable_alarm = self._fn._max(BmsCable_alarm_list)
 
-        # find max. charge voltage (if needed)
         if not settings.OWN_CHARGE_PARAMETERS:
-            if settings.KEEP_MAX_CVL and any("Float" in item for item in ChargeMode_list):
+            
+            if settings.KEEP_MAX_CVL and not any("Cell OVP" in item for item in ChargeMode_list):
                 MaxChargeVoltage = self._fn._max(MaxChargeVoltage_list)
-
             else:
                 MaxChargeVoltage = self._fn._min(MaxChargeVoltage_list)
 
