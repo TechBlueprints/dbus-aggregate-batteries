@@ -393,8 +393,8 @@ class ExtremaWarningThrottleTest(DriverTestCase):
         service = self.make_service([self.healthy, self.blind])
 
         with self.assertLogs(level="WARNING") as captured:
-            # a minute of it: without the throttle this was two lines per cycle
-            self.run_cycles(service, 60)
+            # six repeat periods of it: without the throttle this was two lines per cycle
+            self.run_cycles(service, 6 * driver.MISSING_DATA_LOG_PERIOD)
 
             self.blind.max_cell_voltage = 3.35
             self.blind.min_cell_voltage = 3.30
@@ -405,9 +405,9 @@ class ExtremaWarningThrottleTest(DriverTestCase):
 
         announcements, repeats, recoveries = self.counts(captured)
         # one announcement and one recovery per dimension, and a repeat every
-        # MISSING_DATA_LOG_PERIOD seconds in between: 14 lines, not 120
+        # MISSING_DATA_LOG_PERIOD seconds in between: 14 lines, not two per cycle
         self.assertEqual(2, announcements)
-        self.assertEqual(2 * (60 // driver.MISSING_DATA_LOG_PERIOD - 1), repeats)
+        self.assertEqual(2 * (6 - 1), repeats)
         self.assertEqual(2, recoveries)
         self.assertEqual(14, len(captured.records))
 
@@ -435,13 +435,14 @@ class ExtremaWarningThrottleTest(DriverTestCase):
         self.blind_to_cell_voltages(self.blind)
         service = self.make_service([self.healthy, self.blind])
 
+        period = driver.MISSING_DATA_LOG_PERIOD
         with self.assertLogs(level="WARNING") as captured:
-            self.run_cycles(service, 25)
+            self.run_cycles(service, 2 * period + period // 2)
 
         repeats = [record.getMessage() for record in captured.records if "still missing from" in record.getMessage()]
         self.assertEqual(2, len(repeats))
-        self.assertIn("after 10 s", repeats[0])
-        self.assertIn("after 20 s", repeats[1])
+        self.assertIn("after %d s" % period, repeats[0])
+        self.assertIn("after %d s" % (2 * period), repeats[1])
 
     def test_a_second_battery_going_blind_is_announced_at_once(self):
         """One open window must not swallow the next battery dropping out."""

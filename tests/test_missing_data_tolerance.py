@@ -174,17 +174,18 @@ class ToleratedGapTest(MissingDataTestCase):
         self.assertIn(str(TOLERANCE), announcements[0])
 
     def test_repeated_lines_are_rate_limited(self):
-        """A minute long gap must not produce a line per update cycle."""
-        service = self.make_bank()
+        """A gap spanning several repeat periods must not produce a line per update cycle."""
+        tolerance = 3 * driver.MISSING_DATA_LOG_PERIOD
+        service = self.make_bank(MISSING_DATA_TOLERANCE=tolerance)
         self.vanish(service)
 
         with self.assertLogs(level="WARNING") as captured:
-            for _ in range(TOLERANCE):
+            for _ in range(tolerance):
                 service._update()
                 self.clock.advance(1)
 
         lines = [message for message in captured.output if "Battery data" in message]
-        self.assertLessEqual(len(lines), 1 + TOLERANCE // driver.MISSING_DATA_LOG_PERIOD)
+        self.assertLessEqual(len(lines), 1 + tolerance // driver.MISSING_DATA_LOG_PERIOD)
         # but the state is repeated, so an operator reading the log sees it persist
         self.assertGreater(len(lines), 1)
         self.assertTrue(all(self.vanishing.name in message for message in lines))
