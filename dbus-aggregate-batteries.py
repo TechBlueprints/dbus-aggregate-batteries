@@ -174,8 +174,11 @@ BATTERY_SERVICE_PREFIX = "com.victronenergy.battery."
 # How often the tolerated "a constituent is not serving data" state is repeated
 # in the log while it lasts. Opening and closing the gap are always logged; in
 # between, one line every this many seconds is enough to see that the gap is
-# still open, instead of one line per update cycle.
-MISSING_DATA_LOG_PERIOD = 10
+# still open, instead of one line per update cycle. A minute matches the
+# cadence used for every other periodic emitter on the box: the service log is
+# rotated on size, so a 10 s repeat during a long outage pushed the lines that
+# explain the outage out of the retained window.
+MISSING_DATA_LOG_PERIOD = 60
 
 
 class ConstituentDataMissing(Exception):
@@ -635,8 +638,15 @@ class DbusAggBatService(object):
         # if Dbus monitor not running yet, new trial instead of exception
         try:
             service_names = [str(name) for name in self._dbusConn.list_names() if "com.victronenergy" in str(name)]
+            # one summary line at INFO; the full enumeration of every service on
+            # the bus is dozens of lines per trial and only useful when debugging
+            candidates = [name for name in service_names if settings.BATTERY_SERVICE_NAME in name or settings.DCLOAD_SERVICE_NAME in name]
+            logging.info(
+                "|- Dbusmonitor sees %d com.victronenergy services, %d battery/dcload candidates: %s"
+                % (len(service_names), len(candidates), ", ".join(sorted(candidates)))
+            )
             for service in sorted(service_names):
-                logging.info("|- Dbusmonitor sees: %s" % (service))
+                logging.debug("|- Dbusmonitor sees: %s" % (service))
                 # Current device is in Victron "battery" service
                 battery_service = settings.BATTERY_SERVICE_NAME in service
                 # Current device is in Victron "dcload" service (i.e. a SmartShunt set to DC metering)
