@@ -41,7 +41,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext"))
 
 from vedbus import VeDbusService, VeDbusItemImport  # noqa: E402
 
-VERSION = "4.3.20260611-beta"
+VERSION = "4.3.20260923-beta"
 
 _STATE_FILE_CHARGE = "/data/apps/dbus-aggregate-batteries/storedvalue_charge"
 _STATE_FILE_BALANCING = "/data/apps/dbus-aggregate-batteries/storedvalue_last_balancing"
@@ -907,8 +907,7 @@ class DbusAggBatService(object):
                     if voltage_get is None or current_get is None or power_get is None:
                         raise ValueError(
                             "Missing mandatory D-Bus value while reading battery %s: "
-                            "Voltage=%s, Current=%s, Power=%s"
-                            % (i, voltage_get, current_get, power_get)
+                            "Voltage=%s, Current=%s, Power=%s" % (i, voltage_get, current_get, power_get)
                         )
 
                     Voltage += voltage_get
@@ -1031,7 +1030,7 @@ class DbusAggBatService(object):
                 HighChargeCurrent_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/HighChargeCurrent"))
                 HighDischargeCurrent_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/HighDischargeCurrent"))
                 CellImbalance_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/CellImbalance"))
-                InternalFailure_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/InternalFailure_alarm"))
+                InternalFailure_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/InternalFailure"))
                 HighChargeTemperature_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/HighChargeTemperature"))
                 LowChargeTemperature_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/LowChargeTemperature"))
                 HighTemperature_alarm_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Alarms/HighTemperature"))
@@ -1051,12 +1050,29 @@ class DbusAggBatService(object):
                 # Aggregate charge/discharge parameters
                 else:
                     step = "Read charge parameters"
+                    # A battery that is on the bus but not yet serving data answers None
+                    # here. Appending that None makes Functions._min() return None for the
+                    # whole bank, which is published as an invalid CVL and then raises in
+                    # the periodic logging below, outside any try - and an exception leaving
+                    # _update() makes GLib drop the timeout source, so the driver stops
+                    # updating for good while its service stays on the bus. Raise instead,
+                    # so the read trial handling above retries and restarts as designed.
+                    max_charge_current = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/MaxChargeCurrent")
+                    max_discharge_current = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/MaxDischargeCurrent")
+                    max_charge_voltage = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/MaxChargeVoltage")
+
+                    if max_charge_current is None or max_discharge_current is None or max_charge_voltage is None:
+                        raise ValueError(
+                            "Missing charge parameter while reading battery %s: MaxChargeVoltage=%s, MaxChargeCurrent=%s, MaxDischargeCurrent=%s"
+                            % (i, max_charge_voltage, max_charge_current, max_discharge_current)
+                        )
+
                     # list of max. charge currents to find minimum
-                    MaxChargeCurrent_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/MaxChargeCurrent"))
+                    MaxChargeCurrent_list.append(max_charge_current)
                     # list of max. discharge currents  to find minimum
-                    MaxDischargeCurrent_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/MaxDischargeCurrent"))
+                    MaxDischargeCurrent_list.append(max_discharge_current)
                     # list of max. charge voltages  to find minimum
-                    MaxChargeVoltage_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/MaxChargeVoltage"))
+                    MaxChargeVoltage_list.append(max_charge_voltage)
                     # list of charge modes of batteries (Bulk, Absorption, Float, Keep always max voltage)
                     ChargeMode_list.append(self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Info/ChargeMode"))
 
@@ -1131,11 +1147,10 @@ class DbusAggBatService(object):
         LowTemperature_alarm = self._fn._max(LowTemperature_alarm_list)
         BmsCable_alarm = self._fn._max(BmsCable_alarm_list)
 
-        # find max. charge voltage (if needed)
         if not settings.OWN_CHARGE_PARAMETERS:
-            if settings.KEEP_MAX_CVL and any("Float" in item for item in ChargeMode_list):
+            
+            if settings.KEEP_MAX_CVL and not any("Cell OVP" in item for item in ChargeMode_list):
                 MaxChargeVoltage = self._fn._max(MaxChargeVoltage_list)
-
             else:
                 MaxChargeVoltage = self._fn._min(MaxChargeVoltage_list)
 
@@ -1426,7 +1441,7 @@ class DbusAggBatService(object):
         if settings.OWN_SOC:
             Capacity = self._ownCharge
             Soc = 100 * self._ownCharge / InstalledCapacity
-            ConsumedAmphours = - InstalledCapacity + self._ownCharge   # zero if fully charged, otherwise negative
+            ConsumedAmphours = -InstalledCapacity + self._ownCharge  # zero if fully charged, otherwise negative
             if (self._dbusMon.dbusmon.get_value("com.victronenergy.system", "/SystemState/LowSoc") == 0) and (Current < 0):
                 TimeToGo = -3600 * self._ownCharge / Current
             else:
