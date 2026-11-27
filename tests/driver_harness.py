@@ -32,6 +32,11 @@ What is provided:
   global race.
 * ``driver`` - ``dbus-aggregate-batteries.py`` loaded by path (its file name
   contains dashes) and cached, so repeated loads are cheap and consistent.
+* ``load_velib_stack()`` / ``real_monitor()`` - private copies of the real
+  ``ve_utils``, ``dbusmonitor`` and ``dbusmon`` against a private fake ``dbus``,
+  connected to a ``FakeBusDaemon`` that routes signals by match rule the way
+  dbus-daemon and dbus-python do. They are loaded inside
+  ``mock.patch.dict(sys.modules)``, so none of the stubs above is touched.
 * ``RecordingDbusService`` - a fake of the D-Bus service the publish gate wraps,
   recording registrations and writes separately, and ``new_service()``, the
   ``object.__new__`` helper every suite uses to build a ``DbusAggBatService``
@@ -456,15 +461,26 @@ class FakeBus:
 
 
 class FakeDbusMonitor:
-    """Stands in for DbusMon().dbusmon: scripted get_value per (service, path)."""
+    """Stands in for DbusMon().dbusmon: scripted get_value per (service, path).
+
+    It also records which services were read and which the driver asked it to
+    keep following, so a test can check that every read is of a followed service.
+    """
 
     def __init__(self, values=None, default=0):
         self._values = dict(values or {})
         self._default = default
         self.set_calls = []
+        self.read_services = set()
+        self.followed = None
+        """the services last passed to follow_only(), None until it is called"""
 
     def get_value(self, service, path):
+        self.read_services.add(service)
         return self._values.get((service, path), self._default)
+
+    def follow_only(self, services):
+        self.followed = set(services)
 
     def set_value(self, service, path, value):
         self.set_calls.append((service, path, value))
@@ -697,3 +713,341 @@ class DriverTestCase(unittest.TestCase):
             root.removeHandler(collector)
         self.assertEqual([], collector.messages)
         return result
+
+
+# ---------------------------------------------------------------------------
+# The real velib DbusMonitor, running on a fake bus
+# ---------------------------------------------------------------------------
+
+# Everything above runs the driver against a RecordingDbusMonitor, which never
+# registers a signal receiver. The tests of which signals the monitor listens to
+# need the real ext/velib_python/dbusmonitor.py instead, driving a bus that
+# routes signals the way dbus-daemon and dbus-python do.
+#
+# load_velib_stack() imports private copies of ve_utils, dbusmonitor and dbusmon
+# against a private fake ``dbus`` module, inside mock.patch.dict(sys.modules):
+# the copies keep their references, and sys.modules is exactly as it was
+# afterwards, so the stubs every other suite relies on (above) are untouched and
+# the result does not depend on the order in which suites are imported.
+
+BUSITEM_INTERFACE = "com.victronenergy.BusItem"
+DAEMON_NAME = "org.freedesktop.DBus"
+DAEMON_PATH = "/org/freedesktop/DBus"
+
+
+class FakeDBusException(Exception):
+    def __init__(self, name="org.freedesktop.DBus.Error.Failed", message=""):
+        super().__init__(message or name)
+        self._name = name
+
+    def get_dbus_name(self):
+        return self._name
+
+
+def _velib_dbus_module():
+    """Just enough of dbus-python for the real ve_utils and dbusmonitor to import."""
+
+    class Array(list):
+        def __init__(self, value=(), signature=None, variant_level=0):
+            super().__init__(value)
+
+    class Dictionary(dict):
+        def __init__(self, value=(), signature=None, variant_level=0):
+            super().__init__(value)
+
+    def scalar(name, base):
+        return type(name, (base,), {"__new__": lambda cls, value=base(), variant_level=0: base.__new__(cls, value)})
+
+    class BusConnection:
+        """Only subclassed (dbusmonitor's SystemBus/SessionBus); tests patch those names."""
+
+        TYPE_SESSION = 0
+        TYPE_SYSTEM = 1
+
+    exceptions = _make_module("dbus.exceptions", DBusException=FakeDBusException)
+    bus = _make_module("dbus.bus", BusConnection=BusConnection)
+    service = _make_module("dbus.service")
+    glib = _make_module("dbus.mainloop.glib", DBusGMainLoop=lambda *args, **kwargs: None)
+    mainloop = _make_module("dbus.mainloop", glib=glib)
+    attributes = dict(
+        Array=Array,
+        Dictionary=Dictionary,
+        bus=bus,
+        exceptions=exceptions,
+        service=service,
+        mainloop=mainloop,
+        SystemBus=Unconstructable,
+        SessionBus=Unconstructable,
+    )
+    for name, base in (("Double", float), ("String", str), ("Signature", str), ("ByteArray", bytes), ("Boolean", int)):
+        attributes[name] = scalar(name, base)
+    for name in ("Byte", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64"):
+        attributes[name] = scalar(name, int)
+    module = _make_module("dbus", **attributes)
+    return {
+        "dbus": module,
+        "dbus.bus": bus,
+        "dbus.exceptions": exceptions,
+        "dbus.service": service,
+        "dbus.mainloop": mainloop,
+        "dbus.mainloop.glib": glib,
+    }
+
+
+_velib_stack = None
+
+
+def load_velib_stack():
+    """Private copies of the real ve_utils, dbusmonitor and dbusmon, loaded once.
+
+    Returns a namespace with ``dbus`` (the private fake), ``dbusmonitor`` and
+    ``dbusmon``; ``dbusmon.DbusMon`` builds on the real ``DbusMonitor``.
+    """
+    global _velib_stack
+    if _velib_stack is None:
+        fakes = _velib_dbus_module()
+        with mock.patch.dict(sys.modules, fakes):
+            for name in ("ve_utils", "dbusmonitor", "dbusmon"):
+                sys.modules.pop(name, None)
+            dbusmon = importlib.import_module("dbusmon")
+            dbusmonitor = sys.modules["dbusmonitor"]
+            if not hasattr(dbusmonitor, "VE_INTERFACE"):  # pragma: no cover - would mean the stub was picked up
+                raise AssertionError("loaded the recording dbusmonitor instead of ext/velib_python/dbusmonitor.py")
+        _velib_stack = types.SimpleNamespace(dbus=fakes["dbus"], dbusmonitor=dbusmonitor, dbusmon=dbusmon)
+    return _velib_stack
+
+
+class FakeSignalMatch:
+    """One add_signal_receiver() registration, with the match rule dbus-python would send."""
+
+    def __init__(self, connection, handler, signal_name, dbus_interface, bus_name, path, keywords):
+        self.connection = connection
+        self.handler = handler
+        self.member = signal_name
+        self.interface = dbus_interface
+        self.sender = bus_name
+        self.path = path
+        self.sender_keyword = keywords.pop("sender_keyword", None)
+        self.path_keyword = keywords.pop("path_keyword", None)
+        self.arg0namespace = keywords.pop("arg0namespace", None)
+        self.args_match = keywords
+        if keywords:
+            raise TypeError("FakeSignalMatch: unexpected keywords %r" % (keywords,))
+
+    @property
+    def rule(self):
+        """The match rule string, built the way dbus.connection.SignalMatch.__str__ builds it."""
+        rule = ["type='signal'"]
+        for key, value in (("sender", self.sender), ("path", self.path), ("interface", self.interface), ("member", self.member)):
+            if value is not None:
+                rule.append("%s='%s'" % (key, value))
+        if self.arg0namespace is not None:
+            rule.append("arg0namespace='%s'" % self.arg0namespace)
+        return ",".join(rule)
+
+    def __repr__(self):
+        return "<FakeSignalMatch %s>" % self.rule
+
+    def matches(self, sender, path, interface, member, args):
+        # dbus-daemon resolves sender='<well-known name>' to that name's owner when the
+        # signal is routed, and dbus-python tracks the same owner client-side through
+        # NameOwnerChanged, so together a well-known sender matches whoever owns it now.
+        if self.sender is not None and self.sender != sender and self.connection.daemon.owners.get(self.sender) != sender:
+            return False
+        if self.path is not None and self.path != path:
+            return False
+        if self.interface is not None and self.interface != interface:
+            return False
+        if self.member is not None and self.member != member:
+            return False
+        if self.arg0namespace is not None and not (args and (args[0] == self.arg0namespace or args[0].startswith(self.arg0namespace + "."))):
+            return False
+        return True
+
+    def remove(self):
+        if self in self.connection.matches:
+            self.connection.matches.remove(self)
+            self.connection.events.append(("remove", self.rule))
+
+    def matches_removal_spec(self, sender, path, interface, member, handler, **kwargs):
+        """dbus.connection.SignalMatch.matches_removal_spec, verbatim in effect."""
+        return (
+            handler in (None, self.handler)
+            and sender == self.sender
+            and path == self.path
+            and interface == self.interface
+            and member == self.member
+            and kwargs == self.args_match
+        )
+
+
+class FakeBusConnection:
+    """One client connection to a FakeBusDaemon (what dbus.bus.BusConnection is to dbus-daemon)."""
+
+    def __init__(self, daemon, unique_name):
+        self.daemon = daemon
+        self.unique_name = unique_name
+        self.matches = []
+        self.events = []
+        """("call", bus_name, path, method) and ("add", rule) / ("remove", rule), in order"""
+
+    # ----- the dbus-python API the real DbusMonitor uses -----
+
+    def list_names(self):
+        return [DAEMON_NAME] + list(self.daemon.owners) + list(self.daemon.owners.values())
+
+    def get_name_owner(self, name):
+        try:
+            return self.daemon.owners[name]
+        except KeyError:
+            raise FakeDBusException("org.freedesktop.DBus.Error.NameHasNoOwner")
+
+    def call_blocking(self, bus_name, path, dbus_interface=None, method=None, signature=None, args=()):
+        self.events.append(("call", bus_name, path, method))
+        if bus_name not in self.daemon.owners:
+            raise FakeDBusException("org.freedesktop.DBus.Error.ServiceUnknown")
+        items = self.daemon.items[bus_name]
+        if method == "GetItems" and path == "/":
+            return {item_path: dict(item) for item_path, item in items.items()}
+        if method == "GetValue" and path in items:
+            return items[path]["Value"]
+        raise FakeDBusException("org.freedesktop.DBus.Error.UnknownMethod")
+
+    def add_signal_receiver(self, handler, signal_name=None, dbus_interface=None, bus_name=None, path=None, **keywords):
+        match = FakeSignalMatch(self, handler, signal_name, dbus_interface, bus_name, path, keywords)
+        self.matches.append(match)
+        self.events.append(("add", match.rule))
+        return match
+
+    def remove_signal_receiver(self, handler_or_match, signal_name=None, dbus_interface=None, bus_name=None, path=None, **keywords):
+        for match in list(self.matches):
+            if match is handler_or_match or match.matches_removal_spec(bus_name, path, dbus_interface, signal_name, handler_or_match, **keywords):
+                match.remove()
+
+    # ----- routing -----
+
+    def deliver(self, sender, path, interface, member, args):
+        for match in list(self.matches):
+            if match in self.matches and match.matches(sender, path, interface, member, args):
+                kwargs = {}
+                if match.sender_keyword:
+                    kwargs[match.sender_keyword] = sender
+                if match.path_keyword:
+                    kwargs[match.path_keyword] = path
+                match.handler(*args, **kwargs)
+
+
+class FakeBusDaemon:
+    """A system bus with services on it, routing signals to every FakeBusConnection."""
+
+    def __init__(self):
+        self.owners = {}
+        """well-known name -> unique name of its current owner"""
+
+        self.items = {}
+        """well-known name -> {path: {"Value": ..., "Text": ...}}, what GetItems answers"""
+
+        self.connections = []
+        self._unique = itertools.count(100)
+
+    def connect(self):
+        connection = FakeBusConnection(self, ":1.%d" % next(self._unique))
+        self.connections.append(connection)
+        return connection
+
+    # ----- services coming and going -----
+
+    def start(self, name, values):
+        """Put ``name`` on the bus with ``values`` ({path: value}) and return its unique name."""
+        owner = ":1.%d" % next(self._unique)
+        self.owners[name] = owner
+        self.items[name] = {path: {"Value": value, "Text": str(value)} for path, value in values.items()}
+        self._emit(DAEMON_NAME, DAEMON_PATH, DAEMON_NAME, "NameOwnerChanged", (name, "", owner))
+        return owner
+
+    def stop(self, name):
+        owner = self.owners.pop(name)
+        self._emit(DAEMON_NAME, DAEMON_PATH, DAEMON_NAME, "NameOwnerChanged", (name, owner, ""))
+        return owner
+
+    def restart(self, name):
+        """The service's process restarts: same name, same values, a new unique name."""
+        values = {path: item["Value"] for path, item in self.items[name].items()}
+        self.stop(name)
+        return self.start(name, values)
+
+    # ----- a service publishing -----
+
+    def properties_changed(self, name, path, value):
+        self.items[name][path] = {"Value": value, "Text": str(value)}
+        self._emit(self.owners[name], path, BUSITEM_INTERFACE, "PropertiesChanged", ({"Value": value, "Text": str(value)},))
+
+    def items_changed(self, name, values):
+        changes = {path: {"Value": value, "Text": str(value)} for path, value in values.items()}
+        self.items[name].update(changes)
+        self._emit(self.owners[name], "/", BUSITEM_INTERFACE, "ItemsChanged", (changes,))
+
+    def _emit(self, sender, path, interface, member, args):
+        for connection in list(self.connections):
+            connection.deliver(sender, path, interface, member, args)
+
+    # ----- inspection -----
+
+    def matches(self, interface=None):
+        """Every live receiver on every connection, optionally only those for ``interface``."""
+        return [match for connection in self.connections for match in connection.matches if interface is None or match.interface == interface]
+
+    def busitem_receivers_for(self, name):
+        """BusItem receivers registered for ``name`` by name, its current owner, or no sender at all."""
+        owner = self.owners.get(name)
+        return [match for match in self.matches(BUSITEM_INTERFACE) if match.sender in (None, name) or (owner is not None and match.sender == owner)]
+
+    def delivered_busitem_signals(self, name, path="/Dc/0/Voltage"):
+        """Which receivers a PropertiesChanged and an ItemsChanged from ``name`` would reach."""
+        sender = self.owners[name]
+        return [
+            match
+            for match in self.matches(BUSITEM_INTERFACE)
+            if match.matches(sender, path, BUSITEM_INTERFACE, "PropertiesChanged", ({},))
+            or match.matches(sender, "/", BUSITEM_INTERFACE, "ItemsChanged", ({},))
+        ]
+
+
+def _call_through(func, *args, **kwargs):
+    """ve_utils.exit_on_error without the os._exit(1): a test must see the exception."""
+    return func(*args, **kwargs)
+
+
+def real_monitor(test_case, daemon, value_changed_callback=None):
+    """Build dbusmon.DbusMon on the real DbusMonitor, connected to ``daemon``.
+
+    Returns ``(dbus_mon, glib)``; ``glib`` collects what the monitor defers to the
+    main loop, and ``pump(glib)`` runs it.
+    """
+    stack = load_velib_stack()
+    glib = FakeGLib()
+    for target, name, value in (
+        (stack.dbusmonitor, "GLib", glib),
+        (stack.dbusmonitor, "exit_on_error", _call_through),
+        (stack.dbusmonitor, "SystemBus", daemon.connect),
+        (stack.dbusmonitor, "SessionBus", daemon.connect),
+        (stack.dbus, "SystemBus", daemon.connect),
+        (stack.dbus, "SessionBus", daemon.connect),
+    ):
+        patcher = mock.patch.object(target, name, value)
+        patcher.start()
+        test_case.addCleanup(patcher.stop)
+    # velib logs every scan at INFO; keep the test output readable
+    level = stack.dbusmonitor.logger.level
+    stack.dbusmonitor.logger.setLevel(logging.WARNING)
+    test_case.addCleanup(stack.dbusmonitor.logger.setLevel, level)
+    return stack.dbusmon.DbusMon(value_changed_callback=value_changed_callback), glib
+
+
+def pump(glib):
+    """Run the main loop's idle queue until it is empty (callbacks may queue more)."""
+    for _ in range(100):
+        if not glib.idle_calls:
+            return
+        glib.run_pending_idle()
+    raise AssertionError("idle queue did not drain")  # pragma: no cover

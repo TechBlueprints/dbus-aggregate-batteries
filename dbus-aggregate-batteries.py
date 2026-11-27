@@ -535,6 +535,20 @@ class DbusAggBatService(object):
         self._dbusMon = DbusMon(value_changed_callback=self._on_input_changed)
         logging.info("dbusmonitor started")
 
+    def _followed_services(self):
+        """Every service _update() reads from the monitor's cache under the active config.
+
+        _update() hands this to the monitor, which stops listening to every other
+        service, so a service missing here would read as absent."""
+        services = set(self._batteries_dict.values())
+        if settings.CURRENT_FROM_VICTRON:
+            services.update(self._mppts_list, self._smartShunt_list, [self._multi] if self._multi else [])
+        if settings.OWN_SOC:
+            services.add("com.victronenergy.system")
+        if settings.OWN_CHARGE_PARAMETERS:
+            services.add("com.victronenergy.settings")
+        return services
+
     # ####################################################################
     # ####################################################################
     # ## search Settings, to maintain CCL during dynamic CVL reduction ###
@@ -1320,6 +1334,7 @@ class DbusAggBatService(object):
 
     def _update(self):
         self._updatesRun += 1
+        self._dbusMon.dbusmon.follow_only(self._followed_services())
 
         # DC
         Voltage = 0
