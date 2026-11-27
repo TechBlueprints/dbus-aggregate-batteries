@@ -256,6 +256,13 @@ class DbusAggBatService(object):
     _intervalCurrent = None
     """ bank current read at the last completed update, integrated over the next interval """
 
+    # how many updates ran since the periodic log last said so, and what started
+    # them; the floor's share is the rest (see the periodic logging in _update)
+    _updatesRun = 0
+    _updatesReactive = 0
+    """ run by _update_reactive(), the retries included """
+    _updatesRetry = 0
+
     _extremaMissing = None
     """ {(quantity, battery): {halves, since, last_log}} for the constituents currently
     excluded from an extrema aggregation. Filled in on first use by
@@ -1210,6 +1217,7 @@ class DbusAggBatService(object):
         self._retryPending = False
         # a reactive update already queued reads the same cache and runs first
         if not self._updating:
+            self._updatesRetry += 1
             self._updating = True
             self._update_reactive()
         # one-shot: an update that fails again arms the next retry itself
@@ -1282,6 +1290,7 @@ class DbusAggBatService(object):
         GLib.idle_add(self._update_reactive)
 
     def _update_reactive(self):
+        self._updatesReactive += 1
         try:
             self._update()
         except Exception:
@@ -1313,6 +1322,7 @@ class DbusAggBatService(object):
         return False  # one-shot
 
     def _update(self):
+        self._updatesRun += 1
 
         # DC
         Voltage = 0
@@ -2145,6 +2155,16 @@ class DbusAggBatService(object):
                     _log_value(None if MinCellVoltage is None or MaxCellVoltage is None else MaxCellVoltage - MinCellVoltage, "%.3f"),
                 )
             )
+            logging.info(
+                "|- Updates since the last log: %d (%d on input change, %d retried while failing, %d periodic)"
+                % (
+                    self._updatesRun,
+                    self._updatesReactive - self._updatesRetry,
+                    self._updatesRetry,
+                    self._updatesRun - self._updatesReactive,
+                )
+            )
+            self._updatesRun = self._updatesReactive = self._updatesRetry = 0
 
         return True
 

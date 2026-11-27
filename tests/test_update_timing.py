@@ -15,11 +15,13 @@ behaviour to elapsed time, with the bounds the old one second loop gave:
   UPDATE_INTERVAL_DATA, so neither the exit nor the recovery waits for the floor;
 * the Coulomb counter integrates the current that actually flowed in the
   interval, which matters once intervals can be ten seconds long;
+* the periodic log says how many updates ran, and why.
 
 Time is injected through a clock the test advances by hand, and GLib is a
 recorder, so a "retry" runs only when the test fires it.
 """
 
+import logging
 import unittest
 from unittest import mock
 
@@ -334,6 +336,55 @@ class CoulombCounterTest(TimingTestCase):
             self.clock.advance(10)
             self.assertTrue(service._update())
         self.assertAlmostEqual(charge - 10.0 * 30 / 3600, service._ownCharge, places=9)
+
+
+class UpdateRateLogTest(TimingTestCase):
+    """The periodic log says how many updates ran since the last one, and what caused them."""
+
+    def _log_lines(self, captured):
+        return [message for message in captured.output if "Updates since the last log" in message]
+
+    def test_counts_by_cause_are_logged_once_per_period_and_reset(self):
+        service = self.make_bank(LOG_PERIOD=300)
+        service._logLastPrintTimeStamp = int(self.clock.now)
+
+        # 2 updates from input changes
+        for _ in range(2):
+            service._on_input_changed(self.a.service, "/Dc/0/Voltage", {}, {"Value": 52.1}, 0)
+            self.glib.run_pending_idle()
+            self.clock.advance(1)
+        # 1 failed periodic update and its retry
+        self.break_capacity(service)
+        with self.assertLogs(level="ERROR"):
+            service._update()
+        self.serve(service, [self.a, self.b])
+        self.fire_retry()
+        # periodic floor updates until the log period is over (3 s + 30 x 10 s)
+        with self.assertLogs(level="INFO") as captured:
+            for _ in range(30):
+                self.clock.advance(10)
+                service._update()
+
+        lines = self._log_lines(captured)
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("34 (2 on input change, 1 retried while failing, 31 periodic)", lines[0])
+
+        # the counters start from zero for the next period
+        with self.assertLogs(level="INFO") as captured:
+            for _ in range(30):
+                self.clock.advance(10)
+                service._update()
+        self.assertIn("30 (0 on input change, 0 retried while failing, 30 periodic)", self._log_lines(captured)[0])
+
+    def test_nothing_is_logged_per_update(self):
+        service = self.make_bank(LOG_PERIOD=300)
+        service._logLastPrintTimeStamp = int(self.clock.now)
+        root = logging.getLogger()
+        with mock.patch.object(root, "info") as info:
+            for _ in range(5):
+                self.clock.advance(1)
+                service._update()
+        self.assertEqual([], [c for c in info.call_args_list if "Updates since" in str(c)])
 
 
 if __name__ == "__main__":
