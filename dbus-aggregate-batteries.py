@@ -247,6 +247,12 @@ class DbusAggBatService(object):
     _missingDataExpired = False
     """ True once the current gap has outlived MISSING_DATA_TOLERANCE """
 
+    _readFailingSince = None
+    """ tt.time() of the first counted read failure in the current streak, None while reads succeed """
+
+    _retryPending = False
+    """ True while a one-shot retry of a failed _update() is armed, see _arm_retry() """
+
     _extremaMissing = None
     """ {(quantity, battery): {halves, since, last_log}} for the constituents currently
     excluded from an extrema aggregation. Filled in on first use by
@@ -1148,6 +1154,64 @@ class DbusAggBatService(object):
         self._missingDataLastLog = None
         self._missingDataExpired = False
 
+    def _count_read_failure(self):
+        """
+        Count a failed read, and exit once reads have failed for as long as READ_TRIALS used to allow.
+
+        The update loop used to run every UPDATE_INTERVAL_DATA, so READ_TRIALS
+        failures meant (READ_TRIALS - 1) * UPDATE_INTERVAL_DATA seconds from the
+        first failure to the exit. Updates now run on input changes and at a
+        slow floor, so both are required: the time, because a burst of input
+        changes can deliver READ_TRIALS failed calls within a second, and the
+        count, because two failures far apart were never an exit either. The
+        retry armed below keeps the failures coming at UPDATE_INTERVAL_DATA, so
+        the exit is not later than it was.
+        """
+        now = tt.time()
+        # a clock that steps back must not hold the exit off: count the streak from here
+        if self._readFailingSince is None or now < self._readFailingSince:
+            self._readFailingSince = now
+        failing_for = now - self._readFailingSince
+        allowed = (settings.READ_TRIALS - 1) * settings.UPDATE_INTERVAL_DATA
+        logging.error("Read trial nr. %d of %d: reads failing for %.0f s, exit after %d s" % (self._readTrials, settings.READ_TRIALS, failing_for, allowed))
+        self._readTrials += 1
+        if self._readTrials > settings.READ_TRIALS and failing_for >= allowed:
+            logging.error("DBus read failed. Exiting...")
+            tt.sleep(settings.TIME_BEFORE_RESTART)
+            sys.exit(1)
+        self._arm_retry()
+        # next call allowed
+        return True
+
+    def _arm_retry(self):
+        """
+        Run _update() again in UPDATE_INTERVAL_DATA seconds, once, because the last one did not complete.
+
+        Updates normally run on an input change or at the REACTIVE_FLOOR_S
+        floor. While reads fail, that is too slow twice over: the read trials
+        would take up to READ_TRIALS floors to run out, with the last limits
+        held on the bus all that time, and a constituent that comes back is not
+        announced by a change callback (velib refills its cache silently), so
+        publishing would resume only at the next floor. One retry at a time at
+        UPDATE_INTERVAL_DATA restores the bounds the one second loop gave, and a
+        healthy bank still costs one periodic update per floor.
+        """
+        if self._retryPending:
+            return
+        self._retryPending = True
+        # the millisecond timer, not timeout_add_seconds: that one is rounded to
+        # a shared second boundary and may fire most of a second off the interval
+        GLib.timeout_add(settings.UPDATE_INTERVAL_DATA * 1000, self._retry_update)
+
+    def _retry_update(self):
+        self._retryPending = False
+        # a reactive update already queued reads the same cache and runs first
+        if not self._updating:
+            self._updating = True
+            self._update_reactive()
+        # one-shot: an update that fails again arms the next retry itself
+        return False
+
     # #################################################################################
     # #################################################################################
     # ### aggregate values of physical batteries, perform calculations, update Dbus ###
@@ -1161,7 +1225,10 @@ class DbusAggBatService(object):
     # _update() when a monitored battery value actually changed.  The
     # periodic timer remains as a slow floor (see REACTIVE_FLOOR_S) so
     # time-integration, staleness detection and the read-failure counters
-    # keep ticking even on a completely silent bus.  Bursts are coalesced
+    # keep ticking even on a completely silent bus.  While an update does
+    # not complete (a read failure or a tolerated gap), a one-shot retry at
+    # UPDATE_INTERVAL_DATA stands in for the old loop, so that the read
+    # trials and the recovery keep their bounds (see _arm_retry).  Bursts are coalesced
     # by the _updating guard: changes arriving while an update is queued
     # or running are served by that run (it reads the monitor's current
     # cache), not queued again.  With gated publishers upstream, an idle
@@ -1568,6 +1635,7 @@ class DbusAggBatService(object):
             # keeps the read trial semantics below unchanged, and so does this
             # one once the gap outlives MISSING_DATA_TOLERANCE.
             if isinstance(error, ConstituentDataMissing) and self._tolerate_missing_data(error):
+                self._arm_retry()
                 return True
 
             (
@@ -1581,15 +1649,7 @@ class DbusAggBatService(object):
             logging.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             logging.error(f"Local variables at error: {locals_at_error}")
             logging.error("Occured during step %s, Battery %s." % (step, i))
-            logging.error("Read trial nr. %d" % self._readTrials)
-            self._readTrials += 1
-            if self._readTrials > settings.READ_TRIALS:
-                logging.error("DBus read failed. Exiting...")
-                tt.sleep(settings.TIME_BEFORE_RESTART)
-                sys.exit(1)
-            else:
-                # next call allowed
-                return True
+            return self._count_read_failure()
 
         #####################################################
         # Process collected values (except of dictionaries) #
@@ -1711,13 +1771,7 @@ class DbusAggBatService(object):
                     success = False
                     pass
                 else:
-                    self._readTrials += 1
-                    if self._readTrials > settings.READ_TRIALS:
-                        tt.sleep(settings.TIME_BEFORE_RESTART)
-                        sys.exit(1)
-                    else:
-                        # next call allowed
-                        return True
+                    return self._count_read_failure()
 
             if success:
                 # When a battery-mode SmartShunt is configured to be the
@@ -1745,6 +1799,7 @@ class DbusAggBatService(object):
 
         # must be reset after try-except of all reads
         self._readTrials = 1
+        self._readFailingSince = None
 
         # every constituent answered: close a tolerated gap if one was open. The
         # Coulomb counter below picks the elapsed time up from _timeOld, which no
