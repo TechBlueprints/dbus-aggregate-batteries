@@ -13,6 +13,8 @@ behaviour to elapsed time, with the bounds the old one second loop gave:
   UPDATE_INTERVAL_DATA after the first failure, and not earlier either;
 * while a read is failing (counted or tolerated) a retry is kept armed at
   UPDATE_INTERVAL_DATA, so neither the exit nor the recovery waits for the floor;
+* the Coulomb counter integrates the current that actually flowed in the
+  interval, which matters once intervals can be ten seconds long;
 
 Time is injected through a clock the test advances by hand, and GLib is a
 recorder, so a "retry" runs only when the test fires it.
@@ -301,6 +303,37 @@ class MissingDataBoundsTest(TimingTestCase):
         self.assertTrue(any("complete again" in message for message in captured.output))
         self.assertAlmostEqual(53.2, service._dbusservice.published["/Dc/0/Voltage"])
         self.assertEqual([], self.retries(), "healthy again: no further retry")
+
+
+class CoulombCounterTest(TimingTestCase):
+    """The counter integrates the current that flowed in the interval, i.e. the one read at the previous update."""
+
+    def test_a_step_after_a_quiet_interval_is_not_integrated_backwards(self):
+        service = self.make_bank()
+        self.assertTrue(service._update())
+        charge = service._ownCharge
+
+        # ten quiet seconds at 0 A (no input changed, so no update ran), then a
+        # 100 A load starts and the change triggers an update
+        self.clock.advance(10)
+        self.a.current = self.b.current = 50.0
+        self.serve(service, [self.a, self.b])
+        self.assertTrue(service._update())
+        self.assertAlmostEqual(charge, service._ownCharge, places=9, msg="the 100 A did not flow during the 10 s before it started")
+
+        # the next interval is the one in which the 100 A did flow
+        self.clock.advance(10)
+        self.assertTrue(service._update())
+        self.assertAlmostEqual(charge + 100.0 * 10 / 3600, service._ownCharge, places=9)
+
+    def test_constant_current_is_integrated_as_before(self):
+        self.a.current = self.b.current = -5.0
+        service = self.make_bank()
+        charge = service._ownCharge
+        for _ in range(3):
+            self.clock.advance(10)
+            self.assertTrue(service._update())
+        self.assertAlmostEqual(charge - 10.0 * 30 / 3600, service._ownCharge, places=9)
 
 
 if __name__ == "__main__":

@@ -253,6 +253,9 @@ class DbusAggBatService(object):
     _retryPending = False
     """ True while a one-shot retry of a failed _update() is armed, see _arm_retry() """
 
+    _intervalCurrent = None
+    """ bank current read at the last completed update, integrated over the next interval """
+
     _extremaMissing = None
     """ {(quantity, battery): {halves, since, last_log}} for the constituents currently
     excluded from an extrema aggregation. Filled in on first use by
@@ -1960,12 +1963,19 @@ class DbusAggBatService(object):
         timeNow = tt.time()
         deltaTime = timeNow - self._timeOld
         self._timeOld = timeNow
-        if Current > 0:
+        # integrate the current that flowed during the interval, which is the one
+        # read at the previous update: updates run on every change of an input,
+        # so the current read now has only just started to flow. With intervals
+        # up to REACTIVE_FLOOR_S long, charging the whole interval at the new
+        # current would misplace e.g. 100 A x 10 s = 0.28 Ah on every load step.
+        intervalCurrent = Current if self._intervalCurrent is None else self._intervalCurrent
+        self._intervalCurrent = Current
+        if intervalCurrent > 0:
             # charging (with efficiency)
-            self._ownCharge += Current * (deltaTime / 3600) * settings.BATTERY_EFFICIENCY
+            self._ownCharge += intervalCurrent * (deltaTime / 3600) * settings.BATTERY_EFFICIENCY
         else:
             # discharging
-            self._ownCharge += Current * (deltaTime / 3600)
+            self._ownCharge += intervalCurrent * (deltaTime / 3600)
         self._ownCharge = max(self._ownCharge, 0)
         self._ownCharge = min(self._ownCharge, InstalledCapacity)
 
