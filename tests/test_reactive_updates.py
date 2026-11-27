@@ -72,6 +72,27 @@ RAISING_LINE = _line_of(_innermost_failure, "raise TypeError")
 LOCATION_RE = re.compile(r" in (?P<file>.+) line #(?P<line>\d+)$")
 
 
+# the constituents the service under test aggregates, as _find_batteries leaves them
+TRACKED_BATTERIES = {
+    "BatteryA": "com.victronenergy.battery.ttyUSB0",
+    "BatteryB": "com.victronenergy.battery.ttyUSB1",
+}
+
+# battery class services that are on the bus but are not constituents: the
+# shape of a production Cerbo, where a Lynx shunt, a tank sender and two BLE
+# batteries share the battery class with the two packs being aggregated
+UNTRACKED_BATTERY_SERVICES = [
+    "com.victronenergy.battery.lynx_i2c",
+    "com.victronenergy.battery.seelevel_btp3_0",
+    "com.victronenergy.battery.ble_a1b2c3",
+    "com.victronenergy.battery.ble_d4e5f6",
+]
+
+MULTI = "com.victronenergy.vebus.ttyO1"
+MPPT = "com.victronenergy.solarcharger.ttyUSB0"
+SHUNT = "com.victronenergy.dcload.ttyUSB2"
+SYSTEM = "com.victronenergy.system"
+
 NON_BATTERY_SERVICES = [
     "com.victronenergy.vebus.ttyO1",
     "com.victronenergy.solarcharger.ttyUSB0",
@@ -91,11 +112,15 @@ class ReactiveSchedulingTestCase(unittest.TestCase):
         self.driver = driver_harness.driver
         self.glib = driver_harness.patch_glib(self)
 
-    def _make_service(self, reactive_ready=True, update=None):
+    def _make_service(self, reactive_ready=True, update=None, multi=None, mppts=(), shunts=()):
         return driver_harness.new_service(
             _reactive_ready=reactive_ready,
             _updating=False,
             _update=update if update is not None else _RecordingUpdate(),
+            _batteries_dict=dict(TRACKED_BATTERIES),
+            _multi=multi,
+            _mppts_list=list(mppts),
+            _smartShunt_list=list(shunts),
         )
 
     @staticmethod
@@ -150,6 +175,59 @@ class ReactiveSchedulingTestCase(unittest.TestCase):
         other = self._make_service()
         other._on_input_changed(*self._change(_DbusString("com.victronenergy.vebus.ttyO1")))
         self.assertEqual(len(self.glib.idle_calls), 1)
+
+    def test_battery_services_that_are_not_constituents_are_ignored(self):
+        """A battery class service the aggregation does not read must not cost a recompute."""
+        for name in UNTRACKED_BATTERY_SERVICES:
+            with self.subTest(service=name):
+                service = self._make_service()
+                service._on_input_changed(*self._change(name))
+                self.assertEqual(self.glib.idle_calls, [])
+                self.assertFalse(service._updating)
+
+    def test_every_constituent_schedules_an_update(self):
+        for name in TRACKED_BATTERIES.values():
+            with self.subTest(service=name):
+                self.glib.idle_calls.clear()
+                service = self._make_service()
+                service._on_input_changed(*self._change(name))
+                self.assertEqual(len(self.glib.idle_calls), 1)
+
+    def test_victron_current_sources_trigger_only_when_their_current_is_used(self):
+        """With CURRENT_FROM_VICTRON the bank current is read from these services, so a change there is an input change."""
+        for current_from_victron in (True, False):
+            for name in (MULTI, MPPT, SHUNT):
+                with self.subTest(service=name, CURRENT_FROM_VICTRON=current_from_victron):
+                    self.glib.idle_calls.clear()
+                    driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=current_from_victron, OWN_SOC=False)
+                    service = self._make_service(multi=MULTI, mppts=[MPPT], shunts=[SHUNT])
+                    service._on_input_changed(*self._change(name, path="/Dc/0/Current", value=-3.2))
+                    self.assertEqual(len(self.glib.idle_calls), 1 if current_from_victron else 0)
+
+    def test_system_triggers_only_when_own_soc_reads_it(self):
+        """/SystemState/LowSoc decides the published TimeToGo with OWN_SOC, and is not read otherwise."""
+        for own_soc in (True, False):
+            with self.subTest(OWN_SOC=own_soc):
+                self.glib.idle_calls.clear()
+                driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=False, OWN_SOC=own_soc)
+                service = self._make_service()
+                service._on_input_changed(*self._change(SYSTEM, path="/SystemState/LowSoc", value=1))
+                self.assertEqual(len(self.glib.idle_calls), 1 if own_soc else 0)
+
+    def test_input_services_is_exactly_what_update_reads(self):
+        driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=True, OWN_SOC=True)
+        service = self._make_service(multi=MULTI, mppts=[MPPT], shunts=[SHUNT])
+        self.assertEqual(service._input_services(), set(TRACKED_BATTERIES.values()) | {MULTI, MPPT, SHUNT, SYSTEM})
+
+        driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=False, OWN_SOC=False)
+        self.assertEqual(service._input_services(), set(TRACKED_BATTERIES.values()))
+
+    def test_our_own_service_is_ignored_even_if_it_were_tracked(self):
+        """The second line of defence holds even against a constituent list that somehow names us."""
+        service = self._make_service()
+        service._batteries_dict["Self"] = self.driver.AGGREGATE_SERVICE_NAME
+        service._on_input_changed(*self._change(self.driver.AGGREGATE_SERVICE_NAME))
+        self.assertEqual(self.glib.idle_calls, [])
 
     # ── arming ───────────────────────────────────────────────────────────
 

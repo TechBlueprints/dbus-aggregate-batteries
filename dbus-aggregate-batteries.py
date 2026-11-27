@@ -1239,12 +1239,36 @@ class DbusAggBatService(object):
     # than the old fixed poll.
     REACTIVE_FLOOR_S = 10
 
+    def _input_services(self):
+        """
+        The D-Bus services whose monitored values _update() reads, under the active config.
+
+        The constituent batteries always; with CURRENT_FROM_VICTRON also the
+        Multi, the MPPTs and the SmartShunts the bank current is taken from; with
+        OWN_SOC also the system service, whose /SystemState/LowSoc decides the
+        published TimeToGo. A change in any of them changes what _update() would
+        publish, so each is a trigger. /Settings/CGwacs/OvervoltageFeedIn is read
+        too, but only as a snapshot when dynamic CVL starts, so it is not one.
+        """
+        services = set(self._batteries_dict.values())
+        if settings.CURRENT_FROM_VICTRON:
+            if self._multi is not None:
+                services.add(self._multi)
+            services.update(self._mppts_list)
+            services.update(self._smartShunt_list)
+        if settings.OWN_SOC:
+            services.add("com.victronenergy.system")
+        return services
+
     def _on_input_changed(self, service, path, options, changes, device_instance):
         # DbusMonitor already marshals value changes onto the GLib main loop, so
         # this runs there and needs no locking. It still only schedules: one
         # _update() per burst, instead of one per changed path.
         service = str(service)
-        if not service.startswith(BATTERY_SERVICE_PREFIX):
+        # only a change in something _update() reads is a reason to recompute:
+        # a battery class service that is not a constituent (a Lynx shunt, a tank
+        # sender) would otherwise cost a full recompute on every one of its changes
+        if service not in self._input_services():
             return
         # Never recompute because of our own publishes: that would be a feedback
         # loop, and a nasty one to diagnose in the field. dbusmon's ignoreServices
