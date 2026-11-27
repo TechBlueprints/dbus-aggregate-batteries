@@ -72,6 +72,27 @@ RAISING_LINE = _line_of(_innermost_failure, "raise TypeError")
 LOCATION_RE = re.compile(r" in (?P<file>.+) line #(?P<line>\d+)$")
 
 
+# the constituents the service under test aggregates, as _find_batteries leaves them
+TRACKED_BATTERIES = {
+    "BatteryA": "com.victronenergy.battery.ttyUSB0",
+    "BatteryB": "com.victronenergy.battery.ttyUSB1",
+}
+
+# battery class services that are on the bus but are not constituents: the
+# shape of a production Cerbo, where a Lynx shunt, a tank sender and two BLE
+# batteries share the battery class with the two packs being aggregated
+UNTRACKED_BATTERY_SERVICES = [
+    "com.victronenergy.battery.lynx_i2c",
+    "com.victronenergy.battery.seelevel_btp3_0",
+    "com.victronenergy.battery.ble_a1b2c3",
+    "com.victronenergy.battery.ble_d4e5f6",
+]
+
+MULTI = "com.victronenergy.vebus.ttyO1"
+MPPT = "com.victronenergy.solarcharger.ttyUSB0"
+SHUNT = "com.victronenergy.dcload.ttyUSB2"
+SYSTEM = "com.victronenergy.system"
+
 NON_BATTERY_SERVICES = [
     "com.victronenergy.vebus.ttyO1",
     "com.victronenergy.solarcharger.ttyUSB0",
@@ -91,11 +112,15 @@ class ReactiveSchedulingTestCase(unittest.TestCase):
         self.driver = driver_harness.driver
         self.glib = driver_harness.patch_glib(self)
 
-    def _make_service(self, reactive_ready=True, update=None):
+    def _make_service(self, reactive_ready=True, update=None, multi=None, mppts=(), shunts=()):
         return driver_harness.new_service(
             _reactive_ready=reactive_ready,
             _updating=False,
             _update=update if update is not None else _RecordingUpdate(),
+            _batteries_dict=dict(TRACKED_BATTERIES),
+            _multi=multi,
+            _mppts_list=list(mppts),
+            _smartShunt_list=list(shunts),
         )
 
     @staticmethod
@@ -150,6 +175,59 @@ class ReactiveSchedulingTestCase(unittest.TestCase):
         other = self._make_service()
         other._on_input_changed(*self._change(_DbusString("com.victronenergy.vebus.ttyO1")))
         self.assertEqual(len(self.glib.idle_calls), 1)
+
+    def test_battery_services_that_are_not_constituents_are_ignored(self):
+        """A battery class service the aggregation does not read must not cost a recompute."""
+        for name in UNTRACKED_BATTERY_SERVICES:
+            with self.subTest(service=name):
+                service = self._make_service()
+                service._on_input_changed(*self._change(name))
+                self.assertEqual(self.glib.idle_calls, [])
+                self.assertFalse(service._updating)
+
+    def test_every_constituent_schedules_an_update(self):
+        for name in TRACKED_BATTERIES.values():
+            with self.subTest(service=name):
+                self.glib.idle_calls.clear()
+                service = self._make_service()
+                service._on_input_changed(*self._change(name))
+                self.assertEqual(len(self.glib.idle_calls), 1)
+
+    def test_victron_current_sources_trigger_only_when_their_current_is_used(self):
+        """With CURRENT_FROM_VICTRON the bank current is read from these services, so a change there is an input change."""
+        for current_from_victron in (True, False):
+            for name in (MULTI, MPPT, SHUNT):
+                with self.subTest(service=name, CURRENT_FROM_VICTRON=current_from_victron):
+                    self.glib.idle_calls.clear()
+                    driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=current_from_victron, OWN_SOC=False)
+                    service = self._make_service(multi=MULTI, mppts=[MPPT], shunts=[SHUNT])
+                    service._on_input_changed(*self._change(name, path="/Dc/0/Current", value=-3.2))
+                    self.assertEqual(len(self.glib.idle_calls), 1 if current_from_victron else 0)
+
+    def test_system_triggers_only_when_own_soc_reads_it(self):
+        """/SystemState/LowSoc decides the published TimeToGo with OWN_SOC, and is not read otherwise."""
+        for own_soc in (True, False):
+            with self.subTest(OWN_SOC=own_soc):
+                self.glib.idle_calls.clear()
+                driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=False, OWN_SOC=own_soc)
+                service = self._make_service()
+                service._on_input_changed(*self._change(SYSTEM, path="/SystemState/LowSoc", value=1))
+                self.assertEqual(len(self.glib.idle_calls), 1 if own_soc else 0)
+
+    def test_input_services_is_exactly_what_update_reads(self):
+        driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=True, OWN_SOC=True)
+        service = self._make_service(multi=MULTI, mppts=[MPPT], shunts=[SHUNT])
+        self.assertEqual(service._input_services(), set(TRACKED_BATTERIES.values()) | {MULTI, MPPT, SHUNT, SYSTEM})
+
+        driver_harness.use_stub_settings(self, CURRENT_FROM_VICTRON=False, OWN_SOC=False)
+        self.assertEqual(service._input_services(), set(TRACKED_BATTERIES.values()))
+
+    def test_our_own_service_is_ignored_even_if_it_were_tracked(self):
+        """The second line of defence holds even against a constituent list that somehow names us."""
+        service = self._make_service()
+        service._batteries_dict["Self"] = self.driver.AGGREGATE_SERVICE_NAME
+        service._on_input_changed(*self._change(self.driver.AGGREGATE_SERVICE_NAME))
+        self.assertEqual(self.glib.idle_calls, [])
 
     # ── arming ───────────────────────────────────────────────────────────
 
@@ -282,6 +360,94 @@ class ReactiveSchedulingTestCase(unittest.TestCase):
     def test_reactive_floor_is_a_positive_slow_floor(self):
         self.assertIsInstance(self.driver.DbusAggBatService.REACTIVE_FLOOR_S, int)
         self.assertGreater(self.driver.DbusAggBatService.REACTIVE_FLOOR_S, 1)
+
+
+class UpdateLoopTimerTestCase(unittest.TestCase):
+    """Each of the three places that start the update loop registers the slow floor, and nothing else.
+
+    A second, UPDATE_INTERVAL_DATA timer next to the floor was resurrected by a
+    merge and kept _update() running every second regardless of input changes,
+    which is exactly what the reactive design replaced.
+    """
+
+    MPPTS = ["com.victronenergy.solarcharger.ttyO2", "com.victronenergy.solarcharger.ttyO3"]
+
+    def setUp(self):
+        self.driver = driver_harness.driver
+        self.glib = driver_harness.patch_glib(self)
+
+    def _service(self, bus_names, monitor_values, batteries=None):
+        return driver_harness.new_service(
+            _dbusservice=driver_harness.RecordingDbusService(),
+            _dbusConn=driver_harness.FakeBus(bus_names),
+            _dbusMon=driver_harness.FakeDbusMon(monitor_values, default=None),
+            _batteries_dict=dict(batteries or {}),
+            _smartShunt_list=[],
+            _mppts_list=[],
+            _num_battery_shunts=0,
+            _multi=None,
+            _searchTrials=1,
+            _timeOld=0.0,
+            _ownCharge=0.5,
+            _updating=False,
+            _reactive_ready=False,
+        )
+
+    def _finish_in_find_batteries(self):
+        values = {}
+        for name, service in TRACKED_BATTERIES.items():
+            values[(service, "/ProductName")] = "SerialBattery(Jkbms)"
+            values[(service, "/CustomName")] = name
+            values[(service, "/System/NrOfCellsPerBattery")] = 16
+        service = self._service(sorted(TRACKED_BATTERIES.values()), values)
+        self.assertIs(service._find_batteries(), False)
+        return service
+
+    def _finish_in_find_multis(self):
+        service = self._service([MULTI], {(MULTI, "/ProductName"): "MultiPlus-II"}, TRACKED_BATTERIES)
+        self.assertIs(service._find_multis(), False)
+        return service
+
+    def _finish_in_find_mppts(self):
+        service = self._service(self.MPPTS, {(mppt, "/ProductName"): "SmartSolar" for mppt in self.MPPTS}, TRACKED_BATTERIES)
+        self.assertIs(service._find_mppts(), False)
+        return service
+
+    def _sites(self):
+        return (
+            ("_find_batteries", self._finish_in_find_batteries, {"CURRENT_FROM_VICTRON": False}),
+            ("_find_multis", self._finish_in_find_multis, {"CURRENT_FROM_VICTRON": True, "NR_OF_MPPTS": 0}),
+            ("_find_mppts", self._finish_in_find_mppts, {"CURRENT_FROM_VICTRON": True, "NR_OF_MPPTS": len(self.MPPTS)}),
+        )
+
+    def _update_timers(self, service):
+        update = self.driver.DbusAggBatService._update
+        return [(interval, callback) for interval, callback, _ in self.glib.timeout_calls if getattr(callback, "__func__", None) is update]
+
+    def test_each_start_site_registers_exactly_one_update_timer_at_the_floor(self):
+        for interval_data in (1, 10, 30):
+            for site, finish, overrides in self._sites():
+                with self.subTest(site=site, UPDATE_INTERVAL_DATA=interval_data):
+                    self.glib.timeout_calls.clear()
+                    driver_harness.use_stub_settings(self, UPDATE_INTERVAL_DATA=interval_data, NR_OF_BATTERIES=len(TRACKED_BATTERIES), **overrides)
+                    service = finish()
+
+                    timers = self._update_timers(service)
+                    self.assertEqual(len(timers), 1, "expected exactly one periodic _update timer, got %r" % timers)
+                    interval, callback = timers[0]
+                    self.assertEqual(interval, max(self.driver.DbusAggBatService.REACTIVE_FLOOR_S, interval_data))
+                    self.assertIs(callback.__self__, service)
+                    self.assertTrue(service._reactive_ready)
+
+    def test_no_start_site_schedules_update_more_often_than_the_floor(self):
+        """Whatever else gets scheduled, nothing re-runs _update() on a timer shorter than the floor."""
+        for site, finish, overrides in self._sites():
+            with self.subTest(site=site):
+                self.glib.timeout_calls.clear()
+                driver_harness.use_stub_settings(self, UPDATE_INTERVAL_DATA=1, NR_OF_BATTERIES=len(TRACKED_BATTERIES), **overrides)
+                service = finish()
+                for interval, _ in self._update_timers(service):
+                    self.assertGreaterEqual(interval, self.driver.DbusAggBatService.REACTIVE_FLOOR_S)
 
 
 if __name__ == "__main__":
