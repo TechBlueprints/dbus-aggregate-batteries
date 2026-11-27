@@ -362,5 +362,93 @@ class ReactiveSchedulingTestCase(unittest.TestCase):
         self.assertGreater(self.driver.DbusAggBatService.REACTIVE_FLOOR_S, 1)
 
 
+class UpdateLoopTimerTestCase(unittest.TestCase):
+    """Each of the three places that start the update loop registers the slow floor, and nothing else.
+
+    A second, UPDATE_INTERVAL_DATA timer next to the floor was resurrected by a
+    merge and kept _update() running every second regardless of input changes,
+    which is exactly what the reactive design replaced.
+    """
+
+    MPPTS = ["com.victronenergy.solarcharger.ttyO2", "com.victronenergy.solarcharger.ttyO3"]
+
+    def setUp(self):
+        self.driver = driver_harness.driver
+        self.glib = driver_harness.patch_glib(self)
+
+    def _service(self, bus_names, monitor_values, batteries=None):
+        return driver_harness.new_service(
+            _dbusservice=driver_harness.RecordingDbusService(),
+            _dbusConn=driver_harness.FakeBus(bus_names),
+            _dbusMon=driver_harness.FakeDbusMon(monitor_values, default=None),
+            _batteries_dict=dict(batteries or {}),
+            _smartShunt_list=[],
+            _mppts_list=[],
+            _num_battery_shunts=0,
+            _multi=None,
+            _searchTrials=1,
+            _timeOld=0.0,
+            _ownCharge=0.5,
+            _updating=False,
+            _reactive_ready=False,
+        )
+
+    def _finish_in_find_batteries(self):
+        values = {}
+        for name, service in TRACKED_BATTERIES.items():
+            values[(service, "/ProductName")] = "SerialBattery(Jkbms)"
+            values[(service, "/CustomName")] = name
+            values[(service, "/System/NrOfCellsPerBattery")] = 16
+        service = self._service(sorted(TRACKED_BATTERIES.values()), values)
+        self.assertIs(service._find_batteries(), False)
+        return service
+
+    def _finish_in_find_multis(self):
+        service = self._service([MULTI], {(MULTI, "/ProductName"): "MultiPlus-II"}, TRACKED_BATTERIES)
+        self.assertIs(service._find_multis(), False)
+        return service
+
+    def _finish_in_find_mppts(self):
+        service = self._service(self.MPPTS, {(mppt, "/ProductName"): "SmartSolar" for mppt in self.MPPTS}, TRACKED_BATTERIES)
+        self.assertIs(service._find_mppts(), False)
+        return service
+
+    def _sites(self):
+        return (
+            ("_find_batteries", self._finish_in_find_batteries, {"CURRENT_FROM_VICTRON": False}),
+            ("_find_multis", self._finish_in_find_multis, {"CURRENT_FROM_VICTRON": True, "NR_OF_MPPTS": 0}),
+            ("_find_mppts", self._finish_in_find_mppts, {"CURRENT_FROM_VICTRON": True, "NR_OF_MPPTS": len(self.MPPTS)}),
+        )
+
+    def _update_timers(self, service):
+        update = self.driver.DbusAggBatService._update
+        return [(interval, callback) for interval, callback, _ in self.glib.timeout_calls if getattr(callback, "__func__", None) is update]
+
+    def test_each_start_site_registers_exactly_one_update_timer_at_the_floor(self):
+        for interval_data in (1, 10, 30):
+            for site, finish, overrides in self._sites():
+                with self.subTest(site=site, UPDATE_INTERVAL_DATA=interval_data):
+                    self.glib.timeout_calls.clear()
+                    driver_harness.use_stub_settings(self, UPDATE_INTERVAL_DATA=interval_data, NR_OF_BATTERIES=len(TRACKED_BATTERIES), **overrides)
+                    service = finish()
+
+                    timers = self._update_timers(service)
+                    self.assertEqual(len(timers), 1, "expected exactly one periodic _update timer, got %r" % timers)
+                    interval, callback = timers[0]
+                    self.assertEqual(interval, max(self.driver.DbusAggBatService.REACTIVE_FLOOR_S, interval_data))
+                    self.assertIs(callback.__self__, service)
+                    self.assertTrue(service._reactive_ready)
+
+    def test_no_start_site_schedules_update_more_often_than_the_floor(self):
+        """Whatever else gets scheduled, nothing re-runs _update() on a timer shorter than the floor."""
+        for site, finish, overrides in self._sites():
+            with self.subTest(site=site):
+                self.glib.timeout_calls.clear()
+                driver_harness.use_stub_settings(self, UPDATE_INTERVAL_DATA=1, NR_OF_BATTERIES=len(TRACKED_BATTERIES), **overrides)
+                service = finish()
+                for interval, _ in self._update_timers(service):
+                    self.assertGreaterEqual(interval, self.driver.DbusAggBatService.REACTIVE_FLOOR_S)
+
+
 if __name__ == "__main__":
     unittest.main()

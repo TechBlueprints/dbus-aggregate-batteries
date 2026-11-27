@@ -852,7 +852,6 @@ class DbusAggBatService(object):
                 GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
                 self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
-                GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
 
             # all OK, stop calling this function
             return False
@@ -927,7 +926,6 @@ class DbusAggBatService(object):
             GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
             self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
-            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
 
         # all OK, stop calling this function
         return False
@@ -967,7 +965,6 @@ class DbusAggBatService(object):
             GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
 
             self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
-            GLib.timeout_add_seconds(settings.UPDATE_INTERVAL_DATA, self._update)
             # all OK, stop calling this function
             return False
         elif self._searchTrials < settings.SEARCH_TRIALS:
