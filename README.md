@@ -96,6 +96,7 @@ On start, the program searches for DBus services:
 
 The data from DBus are collected, processed and the results are sent back to DBus when a monitored battery value changes, and in any case periodically.
 Dbus monitor defined in dbusmon.py is used instead of VeDbusItemImport which was very resource hungry (since V2.0). I strongly recommend to everyone modifying the code to keep this technique.
+The monitor listens only to the services the aggregation reads, as listed by `_followed_services()` in the driver, instead of to every service on the bus. Code that reads another service from the monitor must add it there; otherwise the read returns `None` and logs a warning.
 
 ### Dbus publish gate
 
@@ -119,9 +120,11 @@ Charge and discharge limits (`CVL`, `CCL`, `DCL`), alarms and texts are **not** 
 
 ### Reactive updates
 
-The aggregated values are recalculated when one of the monitored batteries reports a changed value, instead of on a fixed one second timer. A burst of changes results in one recalculation, not one per value. Changes therefore reach DBus sooner than with the old poll, and an idle bank costs almost no CPU.
+The aggregated values are recalculated when one of the services the aggregation reads reports a changed value, instead of on a fixed one second timer. Those are the aggregated batteries and, depending on the configuration, the Multi, the MPPTs, the SmartShunts and the system service; other battery services on the bus do not trigger anything. A burst of changes results in one recalculation, not one per value. Changes therefore reach DBus sooner than with the old poll, and an idle bank costs almost no CPU.
 
 The timer remains as a slow floor so that time integration, staleness detection and the read failure counter keep running on a silent bus. Its period is `UPDATE_INTERVAL_DATA`, but at least 10 seconds — with reactive updates a shorter period would only repeat work that has already been done.
+
+While an update does not complete, because a read failed or a battery is not serving data, it is retried every `UPDATE_INTERVAL_DATA` seconds until one completes. A failing read is therefore given up on as fast as with the old timer: the driver exits once there have been `READ_TRIALS` failed reads in a row and the first of them is at least `(READ_TRIALS - 1) * UPDATE_INTERVAL_DATA` seconds old, which is 9 seconds with the defaults.
 
 ### Batteries that stop serving data
 
@@ -133,9 +136,9 @@ While a battery is not serving data, **nothing is published at all**. `Current` 
 
 The published values must therefore be treated as potentially up to `MISSING_DATA_TOLERANCE` seconds old. Nothing on the DBus marks them as stale: while waiting, the last complete aggregate stays exactly as it was, and consumers, DVCC included, act on it. On a bank at rest that costs nothing; under load the published current is that much older than the bank it describes, and a battery that is genuinely broken or has been removed is tolerated in silence for as long as the window lasts. That is why the default is sized to the ordinary case with margin rather than to the worst case seen: every second added to the window is a second of acting on values the aggregation already knows are stale.
 
-The log names the battery and the missing value when the gap opens, repeats it every 10 seconds while it lasts, and logs the recovery.
+The log names the battery and the missing value when the gap opens, repeats it once a minute while it lasts, and logs the recovery.
 
-A battery that reports no cell voltages or temperatures while the others do is not a gap: it is excluded from that one aggregation and the aggregated values are published as usual. This is logged the same way, per battery and per quantity — named when it is first excluded, repeated every 10 seconds while it lasts, and named again when its cell data comes back. A battery running on its fallback shunt has no cell data until its BMS answers, which can be tens of seconds, and the number of update cycles in that time depends on how often the other batteries report a change.
+A battery that reports no cell voltages or temperatures while the others do is not a gap: it is excluded from that one aggregation and the aggregated values are published as usual. This is logged the same way, per battery and per quantity — named when it is first excluded, repeated once a minute while it lasts, and named again when its cell data comes back. A battery running on its fallback shunt has no cell data until its BMS answers, which can be tens of seconds, and the number of update cycles in that time depends on how often the other batteries report a change.
 
 ### Measurement graph
 

@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import unittest
+from unittest import mock
 
 import driver_harness
 
@@ -421,8 +422,56 @@ class UpdateLoopTimerTestCase(unittest.TestCase):
         )
 
     def _update_timers(self, service):
-        update = self.driver.DbusAggBatService._update
-        return [(interval, callback) for interval, callback, _ in self.glib.timeout_calls if getattr(callback, "__func__", None) is update]
+        # _update itself counts too: a timer on it directly is the leftover this suite exists to keep out
+        cls = self.driver.DbusAggBatService
+        periodic = (cls._update, getattr(cls, "_update_periodic", None))
+        return [(interval, callback) for interval, callback, _ in self.glib.timeout_calls if getattr(callback, "__func__", None) in periodic]
+
+    def _floor_callback(self, finish, overrides):
+        """Start the loop at one site and return the floor's callback."""
+        driver_harness.use_stub_settings(self, UPDATE_INTERVAL_DATA=1, NR_OF_BATTERIES=len(TRACKED_BATTERIES), **overrides)
+        timers = self._update_timers(finish())
+        self.assertEqual(len(timers), 1, "expected exactly one periodic _update timer, got %r" % timers)
+        return timers[0][1]
+
+    def test_the_floor_survives_an_exception_escaping_update(self):
+        """GLib removes a timeout source whose callback raises, and the floor is the only periodic source there is."""
+
+        def failing_update(service):
+            raise RuntimeError("escaped the read guards")
+
+        for site, finish, overrides in self._sites():
+            with self.subTest(site=site):
+                self.glib.timeout_calls.clear()
+                with mock.patch.object(self.driver.DbusAggBatService, "_update", failing_update):
+                    floor = self._floor_callback(finish, overrides)
+                    with self.assertLogs(level=logging.ERROR) as logs:
+                        self.assertIs(floor(), True, "a falsy result ends the floor for good")
+                self.assertTrue(any("periodic update" in line and "escaped the read guards" in line for line in logs.output), logs.output)
+
+    def test_the_floor_keeps_running_after_a_normal_update(self):
+        for site, finish, overrides in self._sites():
+            with self.subTest(site=site):
+                self.glib.timeout_calls.clear()
+                ran = []
+                with mock.patch.object(self.driver.DbusAggBatService, "_update", lambda service: ran.append(service) or True):
+                    floor = self._floor_callback(finish, overrides)
+                    self.assertIs(floor(), True)
+                self.assertEqual(len(ran), 1)
+
+    def test_the_floor_does_not_swallow_the_exit_of_a_failed_read(self):
+        """_update() gives up by sys.exit() once the read trials are spent: that must still end the process."""
+
+        def exiting_update(service):
+            raise SystemExit(1)
+
+        for site, finish, overrides in self._sites():
+            with self.subTest(site=site):
+                self.glib.timeout_calls.clear()
+                with mock.patch.object(self.driver.DbusAggBatService, "_update", exiting_update):
+                    floor = self._floor_callback(finish, overrides)
+                    with self.assertRaises(SystemExit):
+                        floor()
 
     def test_each_start_site_registers_exactly_one_update_timer_at_the_floor(self):
         for interval_data in (1, 10, 30):

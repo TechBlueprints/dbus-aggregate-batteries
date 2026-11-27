@@ -539,12 +539,12 @@ class DbusAggBatService(object):
         """Every service _update() reads from the monitor's cache under the active config.
 
         _update() hands this to the monitor, which stops listening to every other
-        service, so a service missing here would read as absent."""
-        services = set(self._batteries_dict.values())
-        if settings.CURRENT_FROM_VICTRON:
-            services.update(self._mppts_list, self._smartShunt_list, [self._multi] if self._multi else [])
-        if settings.OWN_SOC:
-            services.add("com.victronenergy.system")
+        service, so a service missing here would read as absent. It is the trigger
+        set of _input_services() plus the settings service under
+        OWN_CHARGE_PARAMETERS: /Settings/CGwacs/OvervoltageFeedIn is read when
+        dynamic CVL starts, so it has to stay fresh, but a change of it is not a
+        reason to recompute."""
+        services = self._input_services()
         if settings.OWN_CHARGE_PARAMETERS:
             services.add("com.victronenergy.settings")
         return services
@@ -863,7 +863,7 @@ class DbusAggBatService(object):
                 self._timeOld = tt.time()
                 # if current from BMS start the _update loop
                 self._reactive_ready = True
-                GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
+                GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update_periodic)
 
                 self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
 
@@ -937,7 +937,7 @@ class DbusAggBatService(object):
             self._timeOld = tt.time()
             # if no MPPTs start the _update loop
             self._reactive_ready = True
-            GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
+            GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update_periodic)
 
             self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
 
@@ -976,7 +976,7 @@ class DbusAggBatService(object):
         if mpptsCount == settings.NR_OF_MPPTS:
             self._timeOld = tt.time()
             self._reactive_ready = True
-            GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update)
+            GLib.timeout_add_seconds(max(self.REACTIVE_FLOOR_S, settings.UPDATE_INTERVAL_DATA), self._update_periodic)
 
             self._dbusservice["/Measurement/TracksServices"] = ",".join(sorted(self._batteries_dict.values()))
             # all OK, stop calling this function
@@ -1310,27 +1310,49 @@ class DbusAggBatService(object):
             # _update() owns the read-trial and restart logic internally (and exits
             # via SystemExit, which is not caught here), so this only makes an
             # otherwise invisible failure visible.
-            (
-                exception_type,
-                exception_object,
-                exception_traceback,
-            ) = sys.exc_info()
-            # sys.exc_info() hands back the OUTERMOST traceback entry, which is this
-            # frame: reporting it names the self._update() call site above, not the
-            # code that actually failed. Walk to the innermost entry so the summary
-            # line points at the raising statement, and let exc_info=True append the
-            # frames in between, which is what tells you how the recompute got there.
-            while exception_traceback.tb_next is not None:
-                exception_traceback = exception_traceback.tb_next
-            file = exception_traceback.tb_frame.f_code.co_filename
-            line = exception_traceback.tb_lineno
-            logging.error(
-                f"Exception occurred in reactive update: {repr(exception_object)} of type {exception_type} in {file} line #{line}",
-                exc_info=True,
-            )
+            self._log_escaped_exception("reactive")
         finally:
             self._updating = False
         return False  # one-shot
+
+    def _update_periodic(self):
+        """
+        The REACTIVE_FLOOR_S timer's callback: run _update() and keep the timer.
+
+        GLib removes a timeout source whose callback raises. The floor is the only
+        periodic source, and on a silent bank the only thing that notices a
+        constituent that stopped answering, so an exception escaping _update()
+        must not end it. It is logged like one from a reactive update; the exit
+        of a failed read is a SystemExit and still ends the process.
+        """
+        try:
+            self._update()
+        except Exception:
+            self._log_escaped_exception("periodic")
+        return True
+
+    @staticmethod
+    def _log_escaped_exception(kind):
+        """Log the exception being handled, which escaped _update() in a ``kind`` update, with where it was raised."""
+        (
+            exception_type,
+            exception_object,
+            exception_traceback,
+        ) = sys.exc_info()
+        # sys.exc_info() hands back the OUTERMOST traceback entry, which is the
+        # frame of the callback: reporting it names the self._update() call site,
+        # not the code that actually failed. Walk to the innermost entry so the
+        # summary line points at the raising statement, and let exc_info=True
+        # append the frames in between, which is what tells you how the recompute
+        # got there.
+        while exception_traceback.tb_next is not None:
+            exception_traceback = exception_traceback.tb_next
+        file = exception_traceback.tb_frame.f_code.co_filename
+        line = exception_traceback.tb_lineno
+        logging.error(
+            f"Exception occurred in {kind} update: {repr(exception_object)} of type {exception_type} in {file} line #{line}",
+            exc_info=True,
+        )
 
     def _update(self):
         self._updatesRun += 1
