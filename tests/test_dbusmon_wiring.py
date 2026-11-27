@@ -15,7 +15,7 @@ import logging
 import unittest
 
 import driver_harness
-from driver_harness import BUSITEM_INTERFACE, FakeBusDaemon, pump, real_monitor
+from driver_harness import BUSITEM_INTERFACE, Battery, FakeBusDaemon, FakeDbusMon, pump, real_monitor
 
 
 class DbusMonWiringTestCase(unittest.TestCase):
@@ -325,6 +325,67 @@ class OwnServiceTestCase(RealMonitorTestCase):
         self.daemon.properties_changed(AGGREGATE, VOLTAGE, 26.7)
         pump(self.glib)
         self.assertEqual([], [change for change in self.changes if change[0] == AGGREGATE])
+
+
+# ---------------------------------------------------------------------------
+# The driver: it must follow every service it reads from the cache
+# ---------------------------------------------------------------------------
+
+MULTI = VEBUS
+SHUNT = "com.victronenergy.battery.ttyS9"
+DCLOAD_SHUNT = "com.victronenergy.dcload.ttyS10"
+
+
+class DriverFollowsWhatItReadsTestCase(driver_harness.DriverTestCase):
+    """_update() tells the monitor which services to follow; each one it reads must be among them."""
+
+    def run_update(self, service, extra_values=None):
+        values = dict(service._dbusMon.dbusmon._values)
+        values.update(extra_values or {})
+        service._dbusMon = FakeDbusMon(values)
+        service._update()
+        monitor = service._dbusMon.dbusmon
+        self.assertIsNotNone(monitor.followed, "the driver never told the monitor what to follow")
+        self.assertLessEqual(monitor.read_services, monitor.followed, "read from the cache without following it")
+        return monitor
+
+    def test_prod_config_follows_only_the_packs(self):
+        batteries = [Battery("A"), Battery("B")]
+        monitor = self.run_update(self.make_service(batteries))
+        self.assertEqual({battery.service for battery in batteries}, monitor.followed)
+
+    def test_current_from_victron_follows_multi_mppts_and_shunts(self):
+        batteries = [Battery("A"), Battery("B")]
+        service = self.make_service(batteries, CURRENT_FROM_VICTRON=True, NR_OF_MPPTS=1)
+        service._multi = MULTI
+        service._mppts_list = [SOLAR]
+        service._smartShunt_list = [SHUNT, DCLOAD_SHUNT]
+        service._num_battery_shunts = 1
+        service._multi_connected = True
+        monitor = self.run_update(
+            service,
+            {
+                (MULTI, "/Connected"): 1,
+                (MULTI, "/Dc/0/Current"): -2.0,
+                (SOLAR, "/Dc/0/Current"): 4.0,
+                (SHUNT, "/Dc/0/Current"): 1.0,
+                (DCLOAD_SHUNT, "/Dc/0/Current"): 0.5,
+            },
+        )
+        self.assertTrue({MULTI, SOLAR, SHUNT, DCLOAD_SHUNT} <= monitor.read_services, monitor.read_services)
+
+    def test_own_charge_parameters_follows_settings(self):
+        """Dynamic CVL reads /Settings/CGwacs/OvervoltageFeedIn from the cache when it starts."""
+        batteries = [Battery("A", max_cell_voltage=3.7), Battery("B")]
+        service = self.make_service(batteries, OWN_CHARGE_PARAMETERS=True)
+        monitor = self.run_update(service, {(SETTINGS, "/Settings/CGwacs/OvervoltageFeedIn"): 1})
+        self.assertIn(SETTINGS, monitor.read_services)
+
+    def test_own_soc_follows_system(self):
+        batteries = [Battery("A"), Battery("B")]
+        service = self.make_service(batteries, OWN_SOC=True)
+        monitor = self.run_update(service, {(SYSTEM, "/SystemState/LowSoc"): 0})
+        self.assertIn(SYSTEM, monitor.read_services)
 
 
 if __name__ == "__main__":
